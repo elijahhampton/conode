@@ -111,20 +111,6 @@ payment_token = "0x123..."  # Payment token contract address
 conode = "0x456..."        # CoNode protocol contract address
 ```
 
-### Clone and Build
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/conode.git
-cd conode
-
-# Install development tools
-cargo install cargo-watch cargo-audit
-
-# Build the project
-cargo build
-````
-
 # Run all tests
 
 cargo test
@@ -137,3 +123,4 @@ cargo test -p conode-network
 # Run with logging
 
 RUST_LOG=debug cargo test
+````

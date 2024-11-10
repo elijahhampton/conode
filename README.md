@@ -109,6 +109,7 @@ mnemonic = ""  # Optional: Known mnemonic for account recovery
 [contract]
 payment_token = "0x123..."  # Payment token contract address
 conode = "0x456..."        # CoNode protocol contract address
+```
 
 ### Clone and Build
 

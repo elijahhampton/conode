@@ -1,0 +1,48 @@
+[package]
+name = "conode-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+conode-network = { path = "../conode-network" }
+conode-protocol = { path = "../conode-protocol" }
+conode-logging = { path = "../conode-logging" }
+conode-types = { path = "../conode-types" }
+conode-starknet = { path = "../conode-starknet" }
+tokio = { workspace = true, features = ["full"] }
+libp2p = { version = "0.54.0", features = [
+    "identify",
+    "ed25519",
+    "kad",
+    "mdns",
+    "gossipsub",
+    "noise",
+    "yamux",
+    "request-response",
+    "tcp",
+    "tokio",
+    "macros",
+    "tls",
+    "autonat",
+    "dcutr",
+    "relay",
+    "serde",
+] }
+iced = "0.9"
+sha2 = "0.10.8"
+hmac = "0.12.1"
+pbkdf2 = "0.12.2"
+log = "0.4.22"
+env_logger = "0.11.5"
+chrono = "0.4.38"
+iced_native = "0.10.3"
+iced_futures = "0.13.2"
+futures = "0.3.31"
+tokio-stream = "0.1.16"
+getrandom = "0.2.15"
+tiny-bip39 = "2.0.0"
+once_cell = "1.20.2"
+uuid = "1.11.0"
+rand = "0.8.5"
+num-bigint = "0.4.6"
+starknet = "0.12.0"

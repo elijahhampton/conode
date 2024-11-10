@@ -113,13 +113,19 @@ conode = "0x456..."        # CoNode protocol contract address
 
 # Run all tests
 
+```bash
 cargo test
+```
 
 # Run specific crate tests
 
+```bash
 cargo test -p conode-protocol
 cargo test -p conode-network
+```
 
 # Run with logging
 
+```bash
 RUST_LOG=debug cargo test
+```

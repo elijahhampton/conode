@@ -91,7 +91,7 @@ CoNode requires a configuration file specified via the `CONODE_CONFIG` environme
 
 Basic Configuration
 
-````toml
+```toml
 # General Settings
 data_dir = "/path/to/data"    # RocksDB directory
 log_level = "info"            # Node logging level (debug, info, warn, error)
@@ -123,4 +123,3 @@ cargo test -p conode-network
 # Run with logging
 
 RUST_LOG=debug cargo test
-````

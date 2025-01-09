@@ -7,7 +7,7 @@ members = [
     "crates/conode-logging",
     "crates/conode-config",
     "crates/conode-starknet",
-    "crates/conode-types",
+    "crates/conode-types", "crates/conode-state",
 ]
 
 
@@ -77,6 +77,8 @@ pbkdf2 = "0.12.2"
 getrandom = "0.2.15"
 tiny-bip39 = "2.0.0"
 rsa = "0.9.6"
+tiny-keccak = "2.0.2"
+hdpath = "0.6.3"
 
 [workspace.dependencies]
 tokio = { version = "1.0", features = ["full"] }

@@ -4,27 +4,44 @@ use conode_starknet::{
 use conode_types::{
     chain::ChainConfig, crypto::ECDSASignature, traits::chain::ChainItem, work::FlattenedWork,
 };
+use libp2p::futures::TryFutureExt;
+use serde_json::Value;
 use starknet::{
     accounts::Account,
     core::{
         crypto::{ecdsa_sign, ecdsa_verify, ExtendedSignature, Signature},
         types::{
-            BlockId, BlockTag, Call, Felt, FunctionCall, InvokeTransactionResult,
-            TransactionExecutionStatus,
+            BlockId, BlockTag, Call, ContractClass, Felt, FlattenedSierraClass, FunctionCall,
+            InvokeTransactionResult, TransactionExecutionStatus,
         },
         utils::get_selector_from_name,
     },
     providers::Provider,
     signers::{LocalWallet, Signer, VerifyingKey},
 };
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{event, span, Level};
 use uuid::Uuid;
 
+use crate::error::SyncError;
+
+// Chain events as defined in the conode protocol smart contract
+pub enum ChainEvent {
+    WorkSubmission,
+}
+
+impl ToString for ChainEvent {
+    fn to_string(&self) -> String {
+        match self {
+            ChainEvent::WorkSubmission => "WorkSubmission".to_string(),
+            _ => "Unsupported".to_string(),
+        }
+    }
+}
 /// Chain manager for handling Starknet blockchain interactions and transactions.
 /// Manages wallet operations, contract interactions, and transaction processing.
 #[derive(Clone)]
-pub struct ChainManager {
+pub struct ChainContext {
     /// The Starknet wallet for transaction signing
     wallet: LocalWallet,
     /// Provider for Starknet network interactions
@@ -34,10 +51,15 @@ pub struct ChainManager {
     executor: StarknetTransactionExecutor,
     // Configuration for starknet
     config: ChainConfig,
+    // A cached HashMap of event selectors loaded on startup
+    event_selectors: HashMap<String, Felt>,
+
+    // A cached HashMap of function selectors loaded on startup
+    function_selectors: HashMap<String, Felt>,
 }
 
-impl ChainManager {
-    /// Creates a new ChainManager instance with the provided wallet.
+impl ChainContext {
+    /// Creates a new [`ChainContext`] instance with the provided wallet.
     ///
     /// # Arguments
     /// * `wallet` - LocalWallet instance for transaction signing
@@ -66,7 +88,58 @@ impl ChainManager {
                 chain_provider: Arc::clone(&starknet_provider),
             },
             config,
+            event_selectors: HashMap::new(),
+            function_selectors: HashMap::new(),
         })
+    }
+
+    pub async fn check_contract_class_selectors(&mut self) -> Result<(), SyncError> {
+        let mut provider = self.starknet_provider().provider();
+        let class_hash = provider
+            .get_class_hash_at(
+                BlockId::Number(self.config.deployed_block_num),
+                Felt::from_hex(&self.config.conode_contract).unwrap(),
+            )
+            .map_err(|e| SyncError::Internal)
+            .await?;
+        let contract_class = provider
+            .get_class(BlockId::Number(self.config.deployed_block_num), class_hash)
+            .map_err(|_| SyncError::Internal)
+            .await?;
+
+        match contract_class {
+            ContractClass::Sierra(FlattenedSierraClass {
+                abi,
+                sierra_program: _,
+                ..
+            }) => {
+                let class_abi: Value =
+                    serde_json::from_str(&abi).map_err(|_| SyncError::Internal)?;
+
+                if let Value::Array(events) = &class_abi["events"] {
+                    for event in events.iter() {
+                        if event["name"].as_str().is_some()
+                            && !self
+                                .event_selectors
+                                .contains_key(event["name"].as_str().unwrap())
+                        {
+                            self.event_selectors.insert(
+                                event["name"].as_str().unwrap().to_string(),
+                                get_selector_from_name(event["name"].as_str().unwrap())
+                                    .map_err(|_| SyncError::Internal)?,
+                            );
+                        }
+                    }
+                };
+
+                Ok(())
+            }
+            _ => Err(SyncError::Internal),
+        }
+    }
+
+    pub fn selector_as_felt(&self, selector: &str) -> Option<&Felt> {
+        self.event_selectors.get(selector)
     }
 
     /// Returns a reference to the Starknet provider.
@@ -101,7 +174,7 @@ impl ChainManager {
     ///
     /// # Returns
     /// * `Option<ExtendedSignature>` - Signature if successful, None otherwise
-    pub async fn sign(&self, private_key: &Felt, data: &Felt) -> Option<ExtendedSignature> {
+    pub async fn sign(private_key: &Felt, data: &Felt) -> Option<ExtendedSignature> {
         match ecdsa_sign(private_key, data) {
             Ok(signature) => Some(signature),
             Err(_error) => None,
@@ -117,12 +190,7 @@ impl ChainManager {
     ///
     /// # Returns
     /// * `bool` - True if signature is valid
-    pub fn verify(
-        &self,
-        data: Felt,
-        signer_public_key: Felt,
-        data_signature: &ECDSASignature,
-    ) -> bool {
+    pub fn verify(data: Felt, signer_public_key: Felt, data_signature: &ECDSASignature) -> bool {
         let signature: Signature = data_signature.to_owned().into();
 
         match ecdsa_verify(&signer_public_key, &data, &signature) {
@@ -186,7 +254,7 @@ impl ChainManager {
     /// # Returns
     /// * Result containing transaction result or error
     #[allow(deprecated)]
-    pub async fn create_work(
+    pub async fn create_task(
         &self,
         work: &FlattenedWork,
     ) -> Result<InvokeTransactionResult, Box<dyn std::error::Error>> {

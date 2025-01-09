@@ -19,7 +19,7 @@ pub struct WorkMetadata {
     pub description: String,
     pub requirements: Vec<String>,
     pub expiry_date: Option<DateTime<Utc>>,
-    pub reward: Option<u128>,
+    pub reward: Option<u64>,
     pub status: String,
 }
 
@@ -44,6 +44,14 @@ pub struct FlattenedWork {
     pub expiry_date: i64,
     pub reward: u64,
     pub worker_address: FeltWrapper,
+}
+
+impl FlattenedWork {
+    pub fn task_id_felt_to_uuid(task_id: Felt) -> uuid::Uuid {
+        let work_id_str = task_id.to_string();
+        let work_id_u128 = work_id_str.parse::<u128>().unwrap();
+        Uuid::from_u128(work_id_u128)
+    }
 }
 
 impl From<Negotiation> for FlattenedWork {
@@ -134,7 +142,7 @@ impl Work {
         description: String,
         requirements: Vec<String>,
         expiry_date: Option<DateTime<Utc>>,
-        reward: Option<u128>,
+        reward: Option<u64>,
         proposal_id: Option<String>,
         employer_address: Option<String>,
         worker_address: Option<String>,

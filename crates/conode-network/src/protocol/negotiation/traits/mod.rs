@@ -4,6 +4,8 @@ use libp2p::{
     PeerId,
 };
 
+use crate::network::NetworkError;
+
 /// Defines the interface for handling work negotiations between peers in the network.
 /// This includes initiating negotiations, handling requests/responses, and managing
 /// completion acknowledgments.
@@ -21,7 +23,7 @@ pub trait Negotiator {
         peer_id: &PeerId,
         job_id: &String,
         negotiation: &mut Negotiation,
-    ) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), NetworkError>> + Send;
 
     /// Requests acknowledgment of work completion from a peer. This function is invoked by an
     /// `employing` node seeking to accept a negotiation. The `employing` node signs the received
@@ -44,7 +46,7 @@ pub trait Negotiator {
     /// * `request` - The negotiation request details
     /// * `channel` - Channel for sending the response back
     fn handle_negotiation_request(
-        &mut self,
+        &self,
         from: PeerId,
         request_id: InboundRequestId,
         request: NegotiationRequest,
@@ -57,7 +59,7 @@ pub trait Negotiator {
     /// * `request_id` - Identifier of the original outbound request
     /// * `response` - The negotiation response received
     fn handle_negotiation_response(
-        &mut self,
+        &self,
         request_id: OutboundRequestId,
         response: NegotiationResponse,
     ) -> impl std::future::Future<Output = ()> + Send;

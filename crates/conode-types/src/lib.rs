@@ -4,5 +4,8 @@ pub mod negotiation;
 pub mod peer;
 pub mod rsa;
 pub mod solution;
+pub mod sync;
 pub mod traits;
 pub mod work;
+
+

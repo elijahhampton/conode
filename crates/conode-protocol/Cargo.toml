@@ -12,6 +12,7 @@ conode-config = { path = "../conode-config" }
 conode-network = { path = "../conode-network" }
 conode-storage = { path = "../conode-storage" }
 conode-starknet = { path = "../conode-starknet" }
+conode-state = { path = "../conode-state" }
 conode-types = { path = "../conode-types" }
 conode-logging = { path = "../conode-logging" }
 libp2p = { version = "0.54.0", features = [

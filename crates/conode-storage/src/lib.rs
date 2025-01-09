@@ -5,4 +5,5 @@
 #[warn(deprecated)]
 pub mod error;
 pub mod manager;
-pub mod state;
+pub mod disk_db;
+pub mod traits;

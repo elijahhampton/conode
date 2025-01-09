@@ -1,14 +1,24 @@
 use anyhow::{Context, Result};
 use conode_config::bootnode::BOOTSTRAP_NODES;
+use conode_config::configuration_exporter::ConfigurationExporter;
 use conode_logging::logger::{log_info, log_warning};
 use conode_network::behaviour::DistributedBehaviour;
 use conode_network::handle::NetworkHandle;
-use conode_network::network::CoNodeNetwork;
+use conode_network::network::Network;
+use conode_network::request::{RequestHandler, RetryConfig};
 use conode_starknet::crypto::keypair::KeyPair;
-use conode_storage::state::{create_shared_state, SharedStateArc};
+use conode_state::state::service::StateService;
+use conode_state::sync::state::SyncState;
+use conode_storage::disk_db::{DiskDb};
+use conode_storage::manager::chain::ChainContext;
+use conode_storage::manager::storage::{InMemoryDb};
+use conode_storage::traits::{Storage, StorageDefault};
+use conode_types::chain::ChainConfig;
 use conode_types::negotiation::Negotiation;
 use conode_types::peer::PeerInfo;
+use conode_types::sync::SyncEvent;
 use conode_types::work::{ActiveWork, FlattenedWork, WorkBroadcast};
+use libp2p::kad::RoutingUpdate;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use log::{debug, error, info};
 use starknet::core::types::{Felt, InvokeTransactionResult};
@@ -17,31 +27,30 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::{event, span, Level};
+use tokio::sync::{mpsc, RwLock};
+use tracing::{event, instrument, span, Level};
 
 use super::event::{NetworkEvent, NodeCommand};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 
 /// A shareable interface and frontend to interact with CoNode.
-#[derive(Clone)]
-pub struct LaborMarketNode {
-    // A handle to interface with the network
+pub struct Node {
+    // The [`PeerId`] identifying this node
+    pub local_peer_id: PeerId,
+    // The [`NetworkHandle`] to the underlying [`Network`]
     pub network: NetworkHandle,
-    // A command receivier for external [NodeCommand]s.
-    pub command_receiver: Arc<TokioMutex<mpsc::Receiver<NodeCommand>>>,
-    // An event sender for [NetworkEvent]s.
-    event_sender: mpsc::Sender<NetworkEvent>,
-    #[allow(dead_code)] // Runtime is used during create_node
-    runtime: Arc<tokio::runtime::Runtime>,
-    // A shared state with the Network
-    shared_state: SharedStateArc,
+    // A [`StateService`] for chain context and syncing
+    pub state_service: Arc<StateService>,
+    // An InMemoryDb
+    mem_db: Arc<tokio::sync::Mutex<InMemoryDb>>,
+    pub sync_event_receiver: tokio::sync::watch::Receiver<SyncEvent>
 }
 
-impl fmt::Debug for LaborMarketNode {
+impl fmt::Debug for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LaborMarketNode")
+        f.debug_struct("Node")
             .field("network", &"NetworkHandle")
             .field("command_receiver", &"mpsc::Receiver<NodeCommand>")
             .field("event_sender", &"mpsc::Sender<NetworkEvent>")
@@ -50,270 +59,234 @@ impl fmt::Debug for LaborMarketNode {
     }
 }
 
-impl LaborMarketNode {
-    /// Creates a new instance of the LaborMarketNode.
-    pub async fn new() -> Result<(
-        Self,
-        mpsc::Sender<NodeCommand>,
-        mpsc::Receiver<NetworkEvent>,
-        PeerId,
-        PeerInfo,
-    )> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .enable_all()
-                .build()
-                .unwrap(),
-        );
-
+impl Node {
+    /// Create a new node
+    pub async fn new() -> Result<(Self, PeerId, PeerInfo)> {
         let local_keypair = KeyPair::generate();
         let local_peer_id = local_keypair.peer_id();
-
-        let result = runtime.block_on(LaborMarketNode::create_node(
-            local_peer_id,
-            local_keypair,
-            runtime.clone(),
-        ));
-
-        log_info("Starting LaborMarketNode".to_string()).await;
-        Ok(result?)
+        let (node, peer_id, peer_info) = Self::create_node(local_peer_id, local_keypair).await?;
+        Ok((node, peer_id, peer_info))
     }
 
-    /// Creates a new instance of the LaborMarketNode using a libp2p and app seed for the keypair.
-    pub async fn from_existing(
-        mnemonic: &str,
-    ) -> Result<(
-        Self,
-        mpsc::Sender<NodeCommand>,
-        mpsc::Receiver<NetworkEvent>,
-        PeerId,
-        PeerInfo,
-    )> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .enable_all()
-                .build()
-                .unwrap(),
-        );
-
+    /// Create a node from an existing keypair.
+    pub async fn from_existing(mnemonic: &str) -> Result<(Self, PeerId, PeerInfo)> {
         let keypair = KeyPair::from_mnemonic(mnemonic).unwrap();
         let local_peer_id = PeerId::random();
-
-        let result = runtime.block_on(LaborMarketNode::create_node(
-            local_peer_id,
-            keypair,
-            runtime.clone(),
-        ));
-
-        log_info("Starting LaborMarketNode".to_string()).await;
-        Ok(result?)
+        let (node, peer_id, peer_info) = Self::create_node(local_peer_id, keypair).await?;
+        Ok((node, peer_id, peer_info))
     }
 
-    pub async fn solution(
+    /// Get the starknet address represented by this node.
+    pub async fn starknet_address(&self) -> String {
+        let chain_context = self.state_service.context.read().await;
+        chain_context.address()
+    }
+
+    /// Returns the encrypted solution for the task id.
+    pub async fn solution_encrypted(
         &self,
-        work_id: String,
+        task_id: String,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let state = self.shared_state.lock().await;
-        Ok(state
-            .storage_manager
-            .get_work_submission(&work_id)
+        Ok(self
+            .mem_db
+            .lock()
+            .await
+            .get_work_submission(&task_id)
             .unwrap_or(None))
     }
 
+    pub async fn list_task(&self) -> Vec<WorkBroadcast> {
+        match self.mem_db.lock().await.broadcasted_work() {
+            Ok(task) => task,
+            Err(_) => Vec::new()
+        }
+    }
+
+    /// Notify the state service to start the syncing process.
+    pub async fn sync_chain(&self) -> anyhow::Result<()> {
+        // Start sync through state service
+        self.state_service.start_sync().await;
+        Ok(())
+    }
+
+    /// Creates a task on chain
+    /// # Arguments
+    /// task The task data to record on chain
+    /// 
+    /// # Returns
+    /// transaction_hash Felt transaction hash if the transaction returned successful
+    pub async fn create_task(
+        &self,
+        task: &FlattenedWork,
+    ) -> Result<Felt, Box<dyn Error>> {
+        let invoke_result = self
+            .state_service
+            .context
+            .write()
+            .await
+            .create_task(task)
+            .await?;
+
+        Ok(invoke_result.transaction_hash)
+    }
+    
+    /// Returns all solutions for a group of active task.
     pub async fn active_work_with_solutions(
         &self,
         work_group: Vec<ActiveWork>,
     ) -> Option<HashMap<String, Option<Felt>>> {
-        self.shared_state
+        self.mem_db
             .lock()
             .await
-            .storage_manager
             .get_work_submission_hashes(&work_group)
     }
 
-    async fn sync_chain(&self) -> anyhow::Result<()> {
-        let mut state = self.shared_state.lock().await;
-        let _ = state.sync_manager.sync_to_latest_block().await;
-        Ok(())
+    /// Verifies the onchain encrypted solution and completes the
+    /// agreement
+    pub async fn verify_and_complete_solution(
+        &self,
+        work_id: String,
+        solution_hash: Felt,
+    ) -> Result<(), Box<dyn Error>> {
+        self.state_service
+            .context
+            .write()
+            .await
+            .verify_and_complete(work_id, solution_hash)
+            .await
     }
 
-    pub async fn starknet_address(&self) -> String {
-        self.shared_state.lock().await.chain_manager.address()
-    }
-
-    /// Returns a list of `WorkBroadcast` stored in the underlying database
+    /// Returns a list of [`WorkBroadcast`] from the in memory
+    /// data.
+    /// 
+    /// # Returns
+    /// task A vector of [`WorkBroadcast`].
     pub async fn list_work_opportunities(&self) -> Result<Vec<WorkBroadcast>> {
-        match self.shared_state.lock().await.storage_manager.get_work() {
-            Ok(work_opportunities) => Ok(work_opportunities),
-            Err(_) => {
-                log_warning(format!("Failed to list work opportunities")).await;
-                Ok(Vec::new())
-            }
-        }
+        
+        let work_broadcast_json = r#"
+{
+    "work": {
+        "id": "work_123",
+        "proposal_id": null,
+        "proposal_signatures": null,
+        "details": {
+            "description": "Example work task",
+            "requirements": ["Python", "Machine Learning"],
+            "expiry_date": null,
+            "reward": 1000,
+            "status": "Good"
+        },
+        "worker_address": null,
+        "employer_address": "0x1234567890abcdef"
+    },
+    "peer_info": {
+        "peer_id": "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN",
+        "connected_addr": "/ip4/127.0.0.1/tcp/8080",
+        "last_seen": 1682956800,
+        "is_dedicated": false
+    }
+}"#;
+
+let work_broadcast: WorkBroadcast = serde_json::from_str(work_broadcast_json)?;
+let mut a = Vec::new();
+a.push(work_broadcast);
+
+Ok(a)
+
+        // match self.mem_db.lock().await.get_work() {
+        //     Ok(work_opportunities) => Ok(work_opportunities),
+        //     Err(_) => {
+        //         log_warning(format!("Failed to list work opportunities")).await;
+        //         Ok(Vec::new())
+        //     }
+        // }
     }
 
-    pub async fn list_active_work(&self) -> Result<Vec<ActiveWork>> {
-        let works_future = {
-            let state_lock = self.shared_state.lock().await;
-            state_lock.storage_manager.get_active_work()
-        };
-
-        match works_future {
-            Ok(works) => Ok(works),
-            Err(_) => Ok(Vec::new()),
-        }
-    }
-
-    pub async fn get_active_work_by_id(&self, work_id: String) -> Result<Option<ActiveWork>> {
-        let state_lock = self.shared_state.lock().await;
-        state_lock.storage_manager.get_active_work_by_id(work_id)
-    }
-
-    /// Starts the node, handles local setup and begins listening for NodeCommands,
-    /// and various swarm events.
-    pub async fn run(&mut self) -> Result<()> {
-        info!(
-            "Starting LaborMarketNode with PeerId: {}",
-            self.local_peer_id().await
-        );
-
-        self.initial_setup().await;
-        debug!("Completed initial setup.");
-        let mut sync_interval = interval(Duration::from_secs(10));
-
+    /// Monitors various aspects of the node, primarily syncing.
+    #[instrument]
+    pub async fn monitor(&mut self) {
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(12));
+        let mut consecutive_failures = 0;
+        let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+        
+        info!("Starting monitor loop");
         loop {
-            let command = {
-                let mut receiver = self.command_receiver.lock().await;
-
-                tokio::select! {
-                    Some(cmd) = receiver.recv() => cmd,
-                    _ = sync_interval.tick() => {
-                        if let Err(e) = self.sync_chain().await {
-                            error!("Chain sync failed: {:?}", e);
+            tokio::select! {
+                _ = sync_interval.tick() => {
+                    debug!("Starting sync interval");
+                    match self.sync_chain().await {
+                        Ok(_) => {
+                            if consecutive_failures > 0 {
+                                consecutive_failures = 0;
+                                sync_interval = tokio::time::interval(Duration::from_secs(12));
+                                info!("Reset sync interval after recovery");
+                            }
                         }
-                        continue;
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            let backoff_secs = std::cmp::min(12 * 2_u64.pow(consecutive_failures), 300);
+                            sync_interval = tokio::time::interval(Duration::from_secs(backoff_secs));
+                            error!("Sync failed with backoff {}: {}", backoff_secs, e);
+                        }
                     }
                 }
-            };
-
-            if let NodeCommand::Stop(sender) = command {
-                info!("Received stop command. Shutting down...");
-                let _ = sender.send(());
-                break;
-            }
-            if let Err(e) = self.handle_command(command).await {
-                error!("Failed to execute command: {:?}", e);
+                _ = &mut shutdown => {
+                    info!("Received shutdown signal, stopping monitor");
+                    break;
+                }
             }
         }
-
-        Ok(())
     }
 
-    /// Handles commands received from an external interface.
-    async fn handle_command(
-        &mut self,
-        command: NodeCommand,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        match command {
-            NodeCommand::BroadcastJob(job) => {
-                let work_id = job.work.id.clone();
-
-                self.network.broadcast_work(job).await;
-
-                self.event_sender
-                    .send(NetworkEvent::JobBroadcastConfirmed(work_id.to_string()))
-                    .await?;
-
-                return Ok(());
-            }
-            NodeCommand::InitiateNegotiation(peer_id, job_id, negotiation) => {
-                self.network
-                    .initiate_negotiation(peer_id, job_id.clone(), negotiation)
-                    .await;
-
-                self.event_sender
-                    .send(NetworkEvent::NegotiationInitiated(peer_id, job_id))
-                    .await?;
-            }
-            NodeCommand::Jobs => todo!(),
-            NodeCommand::SubscribeToTopic(topic) => {
-                self.network.subscribe(topic.clone()).await;
-                self.event_sender
-                    .send(NetworkEvent::TopicSubscribed(topic))
-                    .await?;
-            }
-            NodeCommand::UnsubscribeFromTopic(topic) => {
-                self.network.unsubscribe(topic.clone()).await;
-                self.event_sender
-                    .send(NetworkEvent::TopicUnsubscribed(topic))
-                    .await?;
-            }
-            NodeCommand::Stop(_) => {
-                self.network.shutdown().await?;
-                self.event_sender
-                    .send(NetworkEvent::ShutdownComplete)
-                    .await?;
-            }
-            NodeCommand::Topics => {}
-            NodeCommand::CreateTopic(_topic) => {}
-        }
-        Ok(())
-    }
-
-    /// Starts swarm listening on all network interfaces over TCP.
-    async fn initial_setup(&mut self) {
+    /// Initial setup for the node includes the following task:
+    /// 1. Start a synchronization thread
+    /// 2. Start listening on all network interfaces
+    /// 3. Bootstrapping node with predefined list
+    pub async fn initial_setup(&mut self) -> Result<(), Box<dyn Error>> {
         let setup_span = span!(Level::TRACE, "initial_setup");
         let _ = setup_span.enter();
 
         // Setup network listening on all network interfaces
         let addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
+   
 
-        if let Err(e) = self.sync_chain().await {
-            panic!("Initial chain sync failed: {:?}", e);
-        }
+        let state_service = self.state_service.clone();
+        // Spawn the initial syncing processing in a worker thread
+        tokio::spawn(async move {
+            state_service.start_sync().await;
+            info!("Initial synchronization step finished");
+        });
 
-        // Start listening
-        match self.network.start_listening(addr.clone()).await {
-            Ok(_) => {
-                event!(Level::TRACE, "Network listener started successfully");
-            }
-            Err(_e) => panic!("Network failed to start and listen on {}", addr.to_string()),
-        }
-        event!(Level::TRACE, "Listening on all network interfaces");
+        let network = &self.network;
+        let  _  = network.start_listening(addr.clone()).await;
+        info!("Listening on all network interfaces");
 
-        // Connect to bootstrap nodes
         for node in BOOTSTRAP_NODES.iter() {
-            debug!("Adding bootstrap node: {}", node.peer_id);
-            self.network
+         
+            let update = network
                 .add_peer_to_kademlia_dht(&node.peer_id, node.addr.parse().unwrap())
-                .await;
-        }
-        event!(Level::TRACE, "Bootstrapped all bootstrap nodes.");
+                .await?;
 
-        // Bootstrap Kademlia
-        info!("Bootstrapping Kademlia DHT");
-        self.network.bootstrap_kademlia().await;
 
-        // Join gossip protocol
-        info!("Joining gossip protocol");
-        match self.network.join_gossip_protocol().await {
-            Ok(true) => {
-                log_info("Your node is now listening for work broadcast!".to_string()).await
+            match update {
+                RoutingUpdate::Success => {
+                    debug!("Bootstraping node with address {} and current state {}", node.peer_id, "success".to_string());
+                }
+                RoutingUpdate::Failed => {
+                    debug!("Bootstraping node with address {} and current state {}", node.peer_id, "failed".to_string());
+                }
+                RoutingUpdate::Pending => {
+                    debug!("Bootstraping node with address {} and current state {}", node.peer_id, "pending".to_string());
+                }
             }
-            Ok(false) => log_warning(
-                "Your node failed to start listening for work broadcast. Retrying in 30 seconds..."
-                    .to_string(),
-            )
-            .await,
-            Err(_e) => log_warning(
-                "Your node failed to start listening for work broadcast. Retrying in 30 seconds..."
-                    .to_string(),
-            )
-            .await,
         }
-        event!(Level::TRACE, "Joined gossipsub work_discovery topic");
+
+        network.bootstrap_kademlia().await;
+        let _joined = network.join_gossip_protocol().await?;
+
+        info!("Initial setup complete");
+
+        Ok(())
     }
 
     /// Returns the PeerInformation for this node.
@@ -326,37 +299,21 @@ impl LaborMarketNode {
         self.network.local_peer_id().await
     }
 
-    pub async fn create_work(
-        &self,
-        work: &FlattenedWork,
-    ) -> Result<InvokeTransactionResult, Box<dyn Error>> {
-        let state_lock = self
-            .shared_state
-            .lock()
-            .await
-            .chain_manager
-            .create_work(work)
-            .await;
-        state_lock
+    pub async fn list_active_work(&self) -> Result<Vec<ActiveWork>> {
+        let works_future = { self.mem_db.lock().await.get_active_work() };
+
+        match works_future {
+            Ok(works) => Ok(works),
+            Err(_) => Ok(Vec::new()),
+        }
     }
 
-    pub async fn verify_and_complete_solution(
-        &self,
-        work_id: String,
-        solution_hash: Felt,
-    ) -> Result<(), Box<dyn Error>> {
-        self.shared_state
-            .lock()
-            .await
-            .chain_manager
-            .verify_and_complete(work_id, solution_hash)
-            .await
+    pub async fn get_active_work_by_id(&self, work_id: String) -> Result<Option<ActiveWork>> {
+        self.mem_db.lock().await.get_active_work_by_id(work_id)
     }
-
+    
     pub async fn list_proposals(&self) -> Result<Vec<Negotiation>> {
-        let state = self.shared_state.lock().await;
-
-        match state.storage_manager.get_all_proposals().await {
+        match self.mem_db.lock().await.get_all_proposals().await {
             Ok(work_opportunities) => Ok(work_opportunities),
             Err(_) => {
                 log_warning(format!("Failed to list work opportunities")).await;
@@ -366,33 +323,33 @@ impl LaborMarketNode {
     }
 
     /// Creates a new labor market node
+    #[instrument]
     async fn create_node(
         local_peer_id: PeerId,
         local_key: KeyPair,
-        runtime: Arc<tokio::runtime::Runtime>,
-    ) -> Result<(
-        LaborMarketNode,
-        mpsc::Sender<NodeCommand>,
-        mpsc::Receiver<NetworkEvent>,
-        PeerId,
-        PeerInfo,
-    )> {
-        // Create channels
-        let (command_tx, command_rx) = mpsc::channel(100);
-        let (event_tx, event_rx) = mpsc::channel(100);
+    ) -> Result<(Node, PeerId, PeerInfo)> {
+        let configuration_exporter = ConfigurationExporter::new()?;
+        let rpc = configuration_exporter.config.rpc.rpc.clone();
+        let chain_id = configuration_exporter.config.rpc.chain_id.clone();
+        let conode_contract_address = configuration_exporter.config.contract.conode.clone();
+        let payment_token_contract_address =
+            configuration_exporter.config.contract.payment_token.clone();
+        let conode_deployment_block_num = configuration_exporter.config.contract.conode_deployment_block;
 
-        // Create wallet
-        let key = SigningKey::from_secret_scalar(Felt::from_bytes_be_slice(
+        info!("RPC configuration set to {}", rpc);
+        info!("Connecting to Starknet chain: {}", chain_id);
+        info!("Using CoNode protocol deployed at {} on block {}", conode_contract_address, conode_deployment_block_num);
+        info!("Using payment token deployed at: {}", payment_token_contract_address);
+        
+        let signing_key = SigningKey::from_secret_scalar(Felt::from_bytes_be_slice(
             local_key.keypair().secret().as_ref(),
         ));
+        let wallet = LocalWallet::from_signing_key(signing_key);
 
-        let wallet = LocalWallet::from_signing_key(key);
-
-        // Create behavior
+        // DistributedBehaviour (Swarm behavior)
         let behaviour =
             DistributedBehaviour::new(local_peer_id, local_key.keypair().clone().into());
-
-        // Build swarm
+        // Swarm
         let swarm = SwarmBuilder::with_existing_identity(local_key.keypair().clone().into())
             .with_tokio()
             .with_tcp(
@@ -405,48 +362,57 @@ impl LaborMarketNode {
             .context("Failed to add behaviour to swarm")?
             .build();
 
-        // Create shared state
-        let shared_state = create_shared_state(wallet, local_peer_id, local_key.starknet_address)?;
-
-        // Create network
-        let (handle, mut network_rx) =
-            CoNodeNetwork::new(swarm, shared_state.clone(), local_key.clone()).await?;
-
-        let handle_clone = handle.clone();
-
-        let local_peer_info = handle.peer_info().await.unwrap().clone();
-
-        runtime.spawn(async move {
-            while let Some(msg) = network_rx.recv().await {
-                handle_clone.handle_message(msg).await;
-            }
-        });
-
-        let node = LaborMarketNode {
-            network: handle,
-            command_receiver: Arc::new(TokioMutex::new(command_rx)),
-            event_sender: event_tx,
-            runtime,
-            shared_state,
+        let local_peer_id = swarm.local_peer_id().clone();
+        info!("Node created with PeerID {}", local_peer_id);
+        let chain_config = ChainConfig {
+            rpc,
+            chain_id,
+            conode_contract: conode_contract_address,
+            payment_token_contract: payment_token_contract_address,
+            deployed_block_num: conode_deployment_block_num,
         };
 
-        Ok((node, command_tx, event_rx, local_peer_id, local_peer_info))
+        let chain_context = Arc::new(RwLock::new(
+            ChainContext::new(wallet, local_key.starknet_address, chain_config.clone()).unwrap(),
+        ));
+
+        let mem_db = Arc::new(Mutex::new(InMemoryDb::new()?));
+
+        let (sync_event_sender, sync_event_receiver) =
+            tokio::sync::watch::channel(SyncEvent::SyncCompleted);
+        let sync_state = SyncState::new(Arc::clone(&mem_db), chain_context.clone(), chain_config, sync_event_sender.clone());
+
+        let arc_swarm = Arc::new(Mutex::new(swarm));
+
+        let (handle, mut network_rx) = Network::new(
+            arc_swarm.clone(),
+            local_key.clone(),
+            chain_context.clone(),
+            Arc::clone(&mem_db),
+            configuration_exporter.clone(),
+            RequestHandler::new(arc_swarm.clone(), mem_db.clone(),Box::new(DiskDb::default()), RetryConfig::default()),
+            Box::new(DiskDb::default())
+        ).await?;
+
+        let local_peer_info = handle.peer_info().await.unwrap().clone();
+        info!("Node created with peer info: {:?}", local_peer_info);
+
+        let node = Node {
+            network: handle,
+            local_peer_id,
+            state_service: Arc::new(StateService {
+                sync_state: Arc::new(RwLock::new(sync_state)),
+                event_rcv: sync_event_receiver.clone(),
+                context: chain_context,
+            }),
+            mem_db,
+            sync_event_receiver
+        };
+
+        Ok((node, local_peer_id, local_peer_info))
     }
 }
 
-impl Drop for LaborMarketNode {
-    fn drop(&mut self) {
-        // Create a new runtime for cleanup if main runtime is already shut down
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
-        rt.block_on(async {
-            if let Err(e) = self.network.shutdown().await {
-                log::error!("Error shutting down network during drop: {:?}", e);
-            }
-
-            if let Err(e) = self.event_sender.send(NetworkEvent::ShutdownComplete).await {
-                log::error!("Error sending shutdown event during drop: {:?}", e);
-            }
-        });
-    }
+impl Drop for Node {
+    fn drop(&mut self) {}
 }

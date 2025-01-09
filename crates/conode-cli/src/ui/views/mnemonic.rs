@@ -1,15 +1,26 @@
 // src/ui/views/mnemonic.rs
 
 use crate::app::messages::Message;
+use crate::GUIState;
 use iced::alignment::Alignment;
 use iced::theme;
 use iced::widget::{Button, Column, Container, Row, Text};
 use iced::{Color, Element, Length};
+use crate::ui::func::gui::traits::create::CreateComponent;
 
 pub trait MnemonicView {
-    fn create_button<'a>(&self, label: &'a str, message: Message) -> Button<'a, Message>;
-    fn create_centered_container<'a>(&self, content: Element<'a, Message>) -> Element<'a, Message>;
     fn mnemonic_words(&self) -> &Vec<String>;
+
+    fn mnemonic_view(&self) -> Element<Message>
+    where
+        Self: Sized;
+}
+
+impl MnemonicView for GUIState {
+
+    fn mnemonic_words(&self) -> &Vec<String> {
+        &self.mnemonic_words
+    }
 
     fn mnemonic_view(&self) -> Element<Message>
     where
@@ -64,7 +75,10 @@ pub trait MnemonicView {
         .padding(20)
         .into();
 
-        let start_node_button = self.create_button("Start Node", Message::StartNode);
+        let start_node_button = self.create_button(
+            "I made a copy of the 24 word mnemonic.",
+            Message::OptionsView,
+        );
 
         let content = Column::new()
             .push(title_column)

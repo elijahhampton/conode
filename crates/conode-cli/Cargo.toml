@@ -8,6 +8,7 @@ conode-network = { path = "../conode-network" }
 conode-protocol = { path = "../conode-protocol" }
 conode-logging = { path = "../conode-logging" }
 conode-types = { path = "../conode-types" }
+conode-storage = { path="../conode-storage" }
 conode-starknet = { path = "../conode-starknet" }
 tokio = { workspace = true, features = ["full"] }
 libp2p = { version = "0.54.0", features = [
@@ -28,7 +29,7 @@ libp2p = { version = "0.54.0", features = [
     "relay",
     "serde",
 ] }
-iced = "0.9"
+iced = { version = "0.9", features = ["tokio"]}
 sha2 = "0.10.8"
 hmac = "0.12.1"
 pbkdf2 = "0.12.2"
@@ -46,3 +47,8 @@ uuid = "1.11.0"
 rand = "0.8.5"
 num-bigint = "0.4.6"
 starknet = "0.12.0"
+lazy_static = "1.5.0"
+async-stream = "0.3.6"
+serde_json.workspace = true
+iced_aw = "0.11.0"
+iced_core = "0.13.2"

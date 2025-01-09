@@ -1,38 +1,47 @@
-use conode_protocol::event::NetworkEvent;
-use std::sync::Arc;
+use conode_types::sync::SyncEvent;
+use std::pin::Pin;
+use std::future::Future;
+use std::task::Context;
+use std::task::Poll;
+use tokio_stream::Stream;
+use crate::Message;
 
-use tokio::sync::{mpsc, Mutex as TokioMutex};
-
-use crate::app::messages::Message;
+/// An [`EventStream`] for polling/receiving [`SyncEvent`].
 pub struct EventStream {
-    pub event_rx: Arc<TokioMutex<mpsc::Receiver<NetworkEvent>>>,
+    receiver: tokio::sync::watch::Receiver<SyncEvent>,
+    changed: Option<
+        Pin<Box<dyn Future<Output = Result<(), tokio::sync::watch::error::RecvError>> + Send>>,
+    >,
 }
 
-impl<H, I> iced_native::subscription::Recipe<H, I> for EventStream
-where
-    H: std::hash::Hasher,
-{
-    type Output = Message;
-
-    fn hash(&self, state: &mut H) {
-        use std::hash::Hash;
-        std::any::TypeId::of::<Self>().hash(state);
+impl EventStream {
+    /// Create a new EventStream.
+    pub fn new(receiver: tokio::sync::watch::Receiver<SyncEvent>) -> Self {
+        Self {
+            receiver,
+            changed: None,
+        }
     }
+}
 
-    fn stream(
-        self: Box<Self>,
-        _input: iced_futures::BoxStream<I>,
-    ) -> iced_futures::BoxStream<Self::Output> {
-        let event_rx = self.event_rx;
-        Box::pin(futures::stream::unfold((), move |_| {
-            let event_rx = event_rx.clone();
-            async move {
-                let mut rx = event_rx.lock().await;
-                match rx.recv().await {
-                    Some(event) => Some((Message::NetworkEvent(event), ())),
-                    None => None,
+impl Stream for EventStream {
+    type Item = Message;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(fut) = self.changed.as_mut() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    let event = (*self.receiver.borrow_and_update()).clone();
+                    self.changed = None;
+                    Poll::Ready(Some(Message::SyncEvent(event)))
                 }
+                Poll::Ready(Err(_)) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
             }
-        }))
+        } else {
+            let mut receiver = self.receiver.clone();
+            self.changed = Some(Box::pin(async move { receiver.changed().await }));
+            Poll::Pending
+        }
     }
 }

@@ -1,7 +1,5 @@
 use crate::{
-    crypto::{ECDSASignature, FeltWrapper},
-    peer::PeerInfo,
-    work::FlattenedWork,
+    crypto::{ECDSASignature, FeltWrapper}, peer::PeerInfo, traits::common::Unqiue, work::FlattenedWork
 };
 
 use libp2p::PeerId;
@@ -126,7 +124,7 @@ impl ProposalStatus {
 pub struct Negotiation {
     pub id: String,
     pub job_id: String,
-    pub proposed_payout: Option<u128>,
+    pub proposed_payout: Option<u64>,
     pub employer_signature: Option<ECDSASignature>,
     pub worker_signature: Option<ECDSASignature>,
     pub worker_public_key: Option<FeltWrapper>,
@@ -137,6 +135,12 @@ pub struct Negotiation {
     pub worker_address: Option<FeltWrapper>,
 }
 
+impl Unqiue for Negotiation {
+    fn id(&self) -> &String {
+        &self.id
+    }
+}
+
 impl Negotiation {
     /// Constructor for creating a new, empty Negotiation instance
     pub fn new(
@@ -144,7 +148,7 @@ impl Negotiation {
         worker_peer_info: Option<PeerInfo>,
         employer: PeerId,
         job_id: String,
-        proposed_payout: Option<u128>,
+        proposed_payout: Option<u64>,
     ) -> Self {
         Negotiation {
             id: Uuid::new_v4().to_string(),

@@ -5,21 +5,32 @@ mod network;
 mod types;
 mod ui;
 
+use iced::widget::{container, Button, Column, Container, Row, Text};
+use iced_aw::date_picker::Date;
 use ::libp2p::PeerId;
 use app::messages::Message;
 use app::state::BroadcastFormState;
 use conode_logging::logger::{initialize_logger, log_warning, AsyncLogger, LogLevel};
 use conode_protocol::event::{NetworkEvent, NodeCommand};
-use conode_protocol::labor_market_node::LaborMarketNode;
+use conode_protocol::labor_market_node::{Node};
 use conode_starknet::crypto::keypair::KeyPair;
 use conode_types::negotiation::Negotiation;
 use conode_types::peer::PeerInfo;
+use conode_types::sync::SyncEvent;
 use conode_types::work::{ActiveWork, Work, WorkBroadcast};
-
-use iced::{executor, theme::Theme, Application, Command, Element, Settings, Subscription};
-use log::{info, warn};
+use iced::{subscription, theme, time, Length};
+use iced::window::Position;
 use network::event_stream::EventStream;
+
+use iced::{executor, theme::Theme, Application, Command, Element, Settings};
+use log::info;
+//use network::event_stream::EventStream;
 use starknet::core::types::Felt;
+use ui::func::gui::traits::create::CreateComponent;
+use ui::state::buttons::ToolbarButtonsState;
+use ui::styles::component::{PaymentBadgeStyle, SyncStatusStyle};
+use ui::styles::container::OuterContainerStyle;
+use ui::views::main::MainContentView;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as TimeDuration;
@@ -29,39 +40,60 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use types::enums::{View, WorkTab};
-use ui::views::active_work::ActiveWorkView;
-use ui::views::logs::LogsView;
-use ui::views::proposals::ProposalView;
-
-use crate::ui::views::broadcast::BroadcastView;
 use crate::ui::views::main::MainView;
-use crate::ui::views::mnemonic::MnemonicView;
-use crate::ui::views::options::OptionsView;
-use crate::ui::views::restore_seed::RestoreSeedView;
-use crate::ui::views::work::WorkView;
+use crate::ui::styles::component::TaskItemStyle;
+use crate::ui::styles::button::ModernButtonStyle;
 
-pub struct ConodeCLI {
-    current_view: View,
+/// The state of the iced GUI.
+pub struct GUIState {
+    /// Interface state
+    // The current content view displayed.
+    current_main_view: MainContentView,
+    // State for toolbar buttons.
+    toolbar_buttons_state: ToolbarButtonsState,
+
+    /// Network state
+    // Broadcasted task received through Gossipsub
+    validated_task_broadcast: Vec<WorkBroadcast>,
+    // Params for the expiry date DatePicker
+
+    /// The mnemonic created for new wallets
     mnemonic_words: Vec<String>,
-    node: Option<LaborMarketNode>,
-    command_tx: Option<mpsc::Sender<NodeCommand>>,
-    event_rx: Option<Arc<Mutex<mpsc::Receiver<NetworkEvent>>>>,
-    node_running: bool,
-    node_runner: Option<tokio::task::JoinHandle<()>>,
-    logger: Arc<Mutex<Option<AsyncLogger>>>,
-    broadcast_form: BroadcastFormState,
-    current_work_tab: WorkTab,
-    work_items: Vec<WorkBroadcast>,
-    local_peer_id: Option<PeerId>,
-    local_peer_info: Option<PeerInfo>,
-    proposals: Vec<Negotiation>,
-    active_works: Vec<ActiveWork>,
+    /// The recovered mnemonic for existing wallets
     recover_seed_words: Vec<String>,
+    /// The underlying [`Node`]
+    node: Option<Arc<Mutex<Node>>>,
+
+    /// Node running state
+    node_running: bool,
+    /// A JoinHandle containing the underlying node run() task
+    node_runner: Option<tokio::task::JoinHandle<()>>,
+    /// A asynchronous logger used for displaying GUI events
+    logger: Arc<Mutex<Option<AsyncLogger>>>,
+    /// [`PeerId`] for the underlying [`Node`]
+    local_peer_id: Option<PeerId>,
+    /// [`PeerInfo`] for the underlying [`Node`]
+    local_peer_info: Option<PeerInfo>,
+    /// State of the broadcast form
+    broadcast_form: BroadcastFormState,
+    /// Current displayed work tab
+    current_work_tab: WorkTab,
+
+    /// Received Proposals
+    proposals: Vec<Negotiation>,
+    /// Active task
+    active_works: Vec<ActiveWork>,
+    /// Active task solutions
     active_work_solutions: HashMap<String, String>,
+    /// Active task solutions submitted
     active_work_solutions_submitted: HashMap<String, Option<Felt>>,
+    sync_status: Option<SyncEvent>,
+    sync_progress_message: String,
+    sync_event_receiver: Option<tokio::sync::watch::Receiver<SyncEvent>>,
+
 }
 
-impl Application for ConodeCLI {
+impl Application for GUIState {
     type Executor = executor::Default;
     type Message = Message;
     type Theme = Theme;
@@ -79,38 +111,36 @@ impl Application for ConodeCLI {
             .collect();
 
         let future = async move {
-            match LaborMarketNode::new().await {
-                Ok((node, command_tx, event_rx, peer_id, peer_info)) => Message::NodeInitialized(
-                    Some(node),
-                    Some(command_tx),
-                    Some(Arc::new(TokioMutex::new(event_rx))),
-                    Some(peer_id),
-                    Some(peer_info),
-                ),
+            match Node::new().await {
+                Ok((node, peer_id, peer_info)) => {
+                    Message::NodeInitialized(
+                        Some(Arc::new(Mutex::new(node))),
+                        Some(peer_id),
+                        Some(peer_info),
+                    )
+                }
                 Err(e) => Message::NodeInitializationFailed(e.to_string()),
             }
         };
 
-        let initial_command = Command::perform(future, std::convert::identity);
+        let initial_command = Command::perform(future, |msg| msg);
 
         (
             Self {
-                current_view: View::Main,
+                current_main_view: MainContentView::ViewTasks,
                 mnemonic_words,
                 node: None,
                 node_runner: None,
-                command_tx: None,
-                event_rx: None,
+
                 node_running: false,
                 logger,
                 broadcast_form: BroadcastFormState {
-                    expiry_date: None,
                     reward: String::new(),
                     requirements: String::new(),
-                    description: String::new(),
+                    description: String::new()
                 },
                 current_work_tab: WorkTab::Stored,
-                work_items: Vec::new(),
+                validated_task_broadcast: Vec::new(),
                 local_peer_id: None,
                 local_peer_info: None,
                 proposals: Vec::new(),
@@ -118,6 +148,10 @@ impl Application for ConodeCLI {
                 recover_seed_words: vec![String::new(); 24],
                 active_work_solutions: HashMap::new(),
                 active_work_solutions_submitted: HashMap::new(),
+                sync_progress_message: "Node initializing...".to_string(),
+                sync_event_receiver: None,
+                sync_status: None,
+                toolbar_buttons_state: ToolbarButtonsState::default()
             },
             initial_command,
         )
@@ -127,35 +161,125 @@ impl Application for ConodeCLI {
         String::from("Conode Dashboard")
     }
 
+    fn subscription(&self) -> iced::Subscription<Message> {
+        match (&self.node, &self.sync_event_receiver) {
+            (Some(_), Some(receiver)) => iced::Subscription::batch(vec![
+                subscription::run_with_id(
+                    "sync_events",
+                    Box::new(EventStream::new(receiver.clone())),
+                ),
+                time::every(tokio::time::Duration::from_secs(1)).map(|_| Message::UpdateSyncStatus),
+            ]),
+            _ => iced::Subscription::none(),
+        }
+    }
+
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
-            Message::NodeInitialized(node, command_tx, event_rx, peer_id, peer_info) => {
-                self.node = node;
-                self.command_tx = command_tx;
-                self.event_rx = event_rx;
-                self.local_peer_id = peer_id;
-                self.local_peer_info = peer_info;
-                let logger = Arc::clone(&self.logger);
+            Message::SwitchMainView(view) => {
+                self.current_main_view = view.clone();
+                match view {
+                    MainContentView::DiscoverTask => {
+                        let _ = self.fetch_discovered_task();
+                    }
+                    MainContentView::ViewTasks => todo!(),
+                    MainContentView::PublishTask => {}
+                    MainContentView::ViewDetails => todo!(),
+                    MainContentView::ViewProposals => todo!(),
+                }
+                Command::none()
+            }
+            // Proposal related [`Message`]s
+            Message::InitiateNegotiation(broadcast) => {
+                let node = self.node.clone().unwrap();
+
+                let recipient = broadcast.peer_info.peer_id;
+                let job_id = broadcast.work.id;
+                let reward = broadcast.work.details.reward;
+                let employer = broadcast.peer_info.peer_id;
+                let peer_info = broadcast.peer_info.clone();
+                let mut negotiation = Negotiation::new(
+                    Some(peer_info),
+                    self.local_peer_info.clone(),
+                    employer,
+                    job_id.clone(),
+                    reward,
+                );
+
                 Command::perform(
                     async move {
-                        let logger_guard = logger.lock().await;
-                        if let Some(logger) = logger_guard.as_ref() {
-                            logger
-                                .log(LogLevel::Info, "Node initialized successfully".to_string())
-                                .await;
-                        }
+                        node.lock()
+                            .await
+                            .network
+                            
+                            .initiate_negotiation(recipient, job_id, &mut negotiation)
+                            .await;
                     },
-                    // async move {
-                    //     if let Ok(logger_guard) = logger.lock().await {
-                    //         if let Some(logger) = logger_guard.as_ref() {
-                    //             logger.log(LogLevel::Info, "Node initialized successfully".to_string()).await;
-                    //         }
-                    //     }
-                    // },
                     |_| Message::Noop,
                 )
             }
+            Message::ViewProposals => {
+                self.fetch_proposals()
+            }
+            Message::TaskDiscovered(task) => {
+                self.validated_task_broadcast = task;
+                Command::none()
+            }
+            Message::ProposalsFetched(proposals) => {
+                self.proposals = proposals;
+                Command::none()
+            }
+            Message::InitSyncReceiver(receiver) => {
+                self.sync_event_receiver = Some(receiver);
+                Command::perform(async move {}, |_| Message::Noop)
+            }
+            Message::OptionsView => {
+               
+                Command::none()
+            }
+            Message::SyncEvent(event) => {
+                self.sync_status = Some(event);
+                // let noop_handle_command = self.handle_sync_event(event).await;
+                let noop_update_command = self.update_sync_ui();
+
+                Command::perform(async move { Message::Noop }, |_| Message::Noop)
+            }
+            Message::NodeInitialized(node, peer_id, peer_info) => {
+                self.node = node;
+                self.local_peer_id = peer_id;
+                self.local_peer_info = peer_info;
+
+                // Store the sync event receiver now, outside the async block
+                if let Some(node) = &self.node {
+                    let node = Arc::clone(node);
+                    let logger = Arc::clone(&self.logger);
+                    
+                    Command::perform(
+                        async move {
+                            // Get the receiver inside the async block
+                            let receiver = node.lock().await.state_service.subscribe_to_events();
+
+                            let logger_guard = logger.lock().await;
+                            if let Some(logger) = logger_guard.as_ref() {
+                                logger
+                                    .log(
+                                        LogLevel::Info,
+                                        "Node initialized successfully".to_string(),
+                                    )
+                                    .await;
+                            }
+
+                            // Return the receiver to be handled in the callback
+                            receiver
+                        },
+                        |receiver| Message::InitSyncReceiver(receiver),
+                    )
+                } else {
+                    Command::none()
+                }
+            }
             Message::NodeInitializationFailed(error) => {
+                info!("{}", error.to_string());
                 let error_msg = format!("Node initialization failed: {}", error);
                 let logger = Arc::clone(&self.logger);
                 Command::perform(
@@ -165,18 +289,14 @@ impl Application for ConodeCLI {
                             logger.log(LogLevel::Error, error_msg).await;
                         }
                     },
-                    // async move {
-                    //     if let Ok(logger_guard) = logger.lock().await {
-                    //         if let Some(logger) = logger_guard.as_ref() {
-                    //             logger.log(LogLevel::Error, error_msg).await;
-                    //         }
-                    //     }
-                    // },
                     |_| Message::Noop,
                 )
             }
+            Message::StartNode => {
+                self.start_node();
+                Command::perform(async move {}, |_| Message::Noop)
+            }
             Message::CreateAccount => {
-                self.current_view = View::Mnemonic;
                 let logger = Arc::clone(&self.logger);
                 Command::perform(
                     async move {
@@ -187,37 +307,26 @@ impl Application for ConodeCLI {
                                 .await;
                         }
                     },
-                    // async move {
-                    //     if let Ok(logger_guard) = logger.lock().await {
-                    //         if let Some(logger) = logger_guard.as_ref() {
-                    //             logger.log(LogLevel::Info, "Account creation initiated".to_string()).await;
-                    //         }
-                    //     }
-                    // },
                     |_| Message::Noop,
                 )
             }
-            Message::StartNode => {
-                self.current_view = View::Options;
-                if self.node.is_none() {
-                    warn!("Warning: Node is None when trying to start");
-                }
-                self.start_node()
-            }
-            Message::NavigateTo(view) => {
-                self.current_view = view;
+
+            Message::NavigateTo(_) => {
+              //  self.current_view = view;
                 Command::none()
             }
             Message::ViewLogs => {
-                self.current_view = View::Logs;
+              
                 Command::none()
             }
             Message::ViewOpportunities => {
-                self.current_view = View::WorkOpportunities;
-                self.fetch_work_items() // Fetch items when view is opened
+                self.fetch_work_items();
+                info!("FTECHING WOKR ITEMS");
+                Command::none()
+           
             }
             Message::WorkItemsFetched(items) => {
-                self.work_items = items;
+                self.validated_task_broadcast = items;
                 Command::none()
             }
             Message::SwitchTab(tab) => {
@@ -229,7 +338,7 @@ impl Application for ConodeCLI {
                 }
             }
             Message::BroadcastWork => {
-                self.current_view = View::BroadcastForm;
+              
                 let logger = Arc::clone(&self.logger);
                 Command::perform(
                     async move {
@@ -285,19 +394,11 @@ impl Application for ConodeCLI {
                                 .await;
                         }
                     },
-                    // async move {
-                    //     if let Ok(logger_guard) = logger.lock().await {
-                    //         if let Some(logger) = logger_guard.as_ref() {
-                    //             logger.log(LogLevel::Info, format!("Network event received: {:?}", event)).await;
-                    //         }
-                    //     }
-                    // },
                     |_| Message::Noop,
                 )
             }
             Message::Noop => Command::none(),
             Message::ExpiryDateSelected(expiry) => {
-                self.broadcast_form.expiry_date = Some(expiry);
                 Command::none()
             }
             Message::RewardChanged(value) => {
@@ -313,7 +414,7 @@ impl Application for ConodeCLI {
                 Command::none()
             }
             Message::BroadcastFormSubmit => {
-                if let Some(_expiry) = self.broadcast_form.expiry_date {
+                if true {
                     let logger = Arc::clone(&self.logger);
                     let form_data = self.broadcast_form.clone();
 
@@ -327,12 +428,12 @@ impl Application for ConodeCLI {
 
                     // Clone what we need
                     let node = self.node.clone();
-                    let command_tx = self.command_tx.clone();
 
                     Command::perform(
                         async move {
-                            if let (Some(node), Some(command_tx)) = (node, command_tx) {
-                                let peer_info = node.peer_info().await;
+                            if let (Some(node)) = (node) {
+                                let node_lock = node.lock().await;
+                                let peer_info = node_lock.network.peer_info().await.unwrap();
 
                                 let work = Work::new(
                                     form_data.description,
@@ -340,41 +441,13 @@ impl Application for ConodeCLI {
                                     None,
                                     Some(form_data.reward.parse().unwrap_or(0)),
                                     None,
-                                    Some(node.starknet_address().await),
+                                    Some(node_lock.starknet_address().await),
                                     None,
                                 );
 
                                 let work_broadcast = WorkBroadcast::new(work, peer_info);
 
-                                match command_tx
-                                    .send(NodeCommand::BroadcastJob(work_broadcast))
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        let logger_guard = logger.lock().await;
-                                        if let Some(logger) = logger_guard.as_ref() {
-                                            logger
-                                                .log(
-                                                    LogLevel::Info,
-                                                    "Work broadcast successful".to_string(),
-                                                )
-                                                .await;
-                                        }
-                                        true
-                                    }
-                                    Err(e) => {
-                                        let logger_guard = logger.lock().await;
-                                        if let Some(logger) = logger_guard.as_ref() {
-                                            logger
-                                                .log(
-                                                    LogLevel::Error,
-                                                    format!("Failed to broadcast work: {}", e),
-                                                )
-                                                .await;
-                                        }
-                                        false
-                                    }
-                                }
+                                false
                             } else {
                                 let logger_guard = logger.lock().await;
                                 if let Some(logger) = logger_guard.as_ref() {
@@ -427,39 +500,7 @@ impl Application for ConodeCLI {
                     |_| Message::Noop,
                 )
             }
-            Message::InitiateNegotiation(broadcast) => {
-                let node = self.node.clone().unwrap();
 
-                let recipient = broadcast.peer_info.peer_id;
-                let job_id = broadcast.work.id;
-                let reward = broadcast.work.details.reward;
-                let employer = broadcast.peer_info.peer_id;
-                let peer_info = broadcast.peer_info.clone();
-                let negotiation = Negotiation::new(
-                    Some(peer_info),
-                    self.local_peer_info.clone(),
-                    employer,
-                    job_id.clone(),
-                    reward,
-                );
-
-                Command::perform(
-                    async move {
-                        node.network
-                            .initiate_negotiation(recipient, job_id, negotiation)
-                            .await;
-                    },
-                    |_| Message::Noop,
-                )
-            }
-            Message::ViewProposals => {
-                self.current_view = View::Proposals;
-                self.fetch_proposals()
-            }
-            Message::ProposalsFetched(proposals) => {
-                self.proposals = proposals;
-                Command::none()
-            }
             Message::ViewCompletedWork => todo!(),
             Message::AcknowledgeProposal(_) => todo!(),
             Message::SignProposal(negotiation) => {
@@ -469,7 +510,10 @@ impl Application for ConodeCLI {
 
                 Command::perform(
                     async move {
-                        node.network
+                        let node_lock = node.lock().await;
+                        node_lock
+                            .network
+                        
                             .request_completion_ack(worker_peer_info, negotiation_clone)
                             .await;
                     },
@@ -486,7 +530,10 @@ impl Application for ConodeCLI {
                 let node = self.node.clone().unwrap();
                 Command::perform(
                     async move {
-                        node.network
+                        node.lock()
+                            .await
+                            .network
+                   
                             .send_completion_confirmation_request(
                                 proposal.worker_peer_info.unwrap().peer_id,
                                 proposal.id,
@@ -497,7 +544,7 @@ impl Application for ConodeCLI {
                 )
             }
             Message::ViewActiveWork => {
-                self.current_view = View::ActiveWork;
+
                 self.fetch_active_works()
             }
             Message::ActiveWorksFetched(works) => {
@@ -524,31 +571,23 @@ impl Application for ConodeCLI {
                 Command::none()
             }
             Message::RestoreAndStartNode(_) => {
-                // Validate seed words
-                info!("Restore and start node....");
                 if self.recover_seed_words.iter().all(|word| !word.is_empty()) {
-                    // Create keypair from seed words
                     match KeyPair::from_mnemonic(&self.recover_seed_words.join(" ")) {
                         Ok(_) => {
-                            info!("Starting node");
-                            self.current_view = View::Options;
-                            // Continue with normal node startup
-                            self.start_node()
+                            self.start_node();
+                            Command::none()
                         }
                         Err(_) => {
                             info!("error");
-                            // Handle invalid seed phrase
                             Command::none()
                         }
                     }
                 } else {
                     info!("incomplete seed phrase");
-                    // Handle incomplete seed phrase
                     Command::none()
                 }
             }
             Message::RestoreFromSeed => {
-                self.current_view = View::RestoreSeed;
                 Command::none()
             }
             Message::SolutionChanged(work_id, solution) => {
@@ -561,17 +600,12 @@ impl Application for ConodeCLI {
                     None => return Command::none(),
                 };
 
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-
-                // Uses Iced's Command::perform properly
                 Command::perform(
                     async move {
-                        runtime.block_on(async {
-                            node.verify_and_complete_solution(work_id, solution).await
-                        })
+                        node.lock()
+                            .await
+                            .verify_and_complete_solution(work_id, solution)
+                            .await
                     },
                     |_| Message::SolutionDecision,
                 )
@@ -584,8 +618,9 @@ impl Application for ConodeCLI {
 
                     Command::perform(
                         async move {
-                            if let Some(mut node) = node {
-                                let active_work = node.get_active_work_by_id(work_id).await;
+                            if let Some(node) = node {
+                                let  node_lock = node.lock().await;
+                                let active_work = node_lock.get_active_work_by_id(work_id).await;
 
                                 match active_work {
                                     Ok(work) => {
@@ -595,11 +630,14 @@ impl Application for ConodeCLI {
                                                 work.employer_peer_id.clone().to_string()
                                             );
 
-                                            node.network.send_completion_confirmation_ack(
-                                                &work.employer_peer_id,
-                                                work.work.id,
-                                                solution,
-                                            );
+                                            node_lock
+                                                .network
+                                        
+                                                .send_completion_confirmation_ack(
+                                                    &work.employer_peer_id,
+                                                    work.work.id,
+                                                    solution,
+                                                ).await;
                                         }
                                     }
                                     Err(_) => {
@@ -615,34 +653,38 @@ impl Application for ConodeCLI {
                 }
             }
             Message::SolutionDecision => {
-                info!("Solution Accepted");
                 Command::none()
             }
+            Message::UpdateSyncStatus => {
+                let _ = self.update_sync_ui();
+                Command::none()
+            }
+            Message::TabChanged(_) => todo!(),
+            Message::FilterMarket(_, _) => todo!(),
+            Message::ChooseDate => todo!(),
+            Message::SubmitDate(_) => todo!(),
+            Message::CancelDate => todo!(),
         }
     }
-
     fn view(&self) -> Element<Message> {
-        match self.current_view {
-            View::Main => self.main_view(),
-            View::Mnemonic => self.mnemonic_view(),
-            View::Options => self.options_view(),
-            View::Logs => self.logs_view(),
-            View::BroadcastForm => self.broadcast_form_view(),
-            View::WorkOpportunities => self.work_opportunities_view(),
-            View::Proposals => self.proposals_view(),
-            View::ActiveWork => self.active_work_view(),
-            View::RestoreSeed => self.restore_seed_view(),
-        }
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        if let Some(ref event_rx) = self.event_rx {
-            iced::Subscription::from_recipe(EventStream {
-                event_rx: Arc::clone(event_rx),
-            })
-        } else {
-            Subscription::none()
-        }
+        let content = self.main_view();
+    
+        // Create the sync status bar
+        let sync_status = Container::new(
+            Row::new()
+                .push(Text::new(&self.sync_progress_message).size(12))
+                .width(Length::Fill)
+        )
+        .width(Length::Fill)
+        .padding(10)
+        .style(theme::Container::Custom(Box::new(SyncStatusStyle)));
+    
+        Column::new()
+            .push(sync_status)
+            .push(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn theme(&self) -> Theme {
@@ -650,7 +692,155 @@ impl Application for ConodeCLI {
     }
 }
 
-impl ConodeCLI {
+impl CreateComponent for GUIState {
+    fn create_button<'a>(&self, label: &'a str, message: Message) -> Button<'a, Message> {
+        Button::new(
+            Container::new(Text::new(label).size(12)) 
+                .width(Length::Fill)
+                .height(Length::Fixed(16.0)) 
+                .center_y()
+                .center_x(),
+        )
+        .width(Length::Shrink)
+        .padding([2, 8]) 
+        .style(theme::Button::Custom(Box::new(ModernButtonStyle)))
+        .on_press(message)
+     }
+
+    fn create_centered_container<'a>(&self, content: Element<'a, Message>) -> Element<'a, Message> {
+        Container::new(content)
+            .width(Length::Fixed(1600.0))
+            .height(Length::Fixed(900.0))
+            .style(theme::Container::Custom(Box::new(OuterContainerStyle)))
+            .center_x()
+            .center_y()
+            .into()
+    }
+    
+    /// Creates a task item 
+    fn create_task_item<'a>(
+        &self,
+        title: &'a str,
+        payment: &'a str,
+        requirements: &'a str,
+        time: &'a str,
+    ) -> Container<'a, Message> {
+        Container::new(
+            Row::new()
+                .spacing(8)
+                .push(
+                    Column::new()
+                        .width(Length::Fill)
+                        .spacing(4)
+                        .push(
+                            Row::new()
+                                .spacing(8)
+                                .align_items(iced::Alignment::Start)
+                                .push(
+                                    Text::new(title)
+                                        .size(13)
+                                        .width(Length::Fill)
+                                
+                                )
+                                .push(
+                                    Container::new(Text::new(payment).size(12))
+                                        .style(theme::Container::Custom(Box::new(PaymentBadgeStyle)))
+                                        .padding([2, 6])
+                                )
+                        )
+                        .push(
+                            Row::new()
+                                .spacing(8)
+                                .push(
+                                    Text::new(requirements)
+                                        .size(11)
+                                        .style(theme::Text::Color(iced::Color::from_rgb(0.6, 0.6, 0.7)))
+                                )
+                                .push(
+                                    Text::new("•")
+                                        .size(11)
+                                        .style(theme::Text::Color(iced::Color::from_rgb(0.4, 0.4, 0.5)))
+                                )
+                                .push(
+                                    Text::new(time)
+                                        .size(11)
+                                        .style(theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.6)))
+                                )
+                        )
+                )
+        )
+        .style(theme::Container::Custom(Box::new(TaskItemStyle)))
+        .padding([8, 12])
+    }
+}
+
+impl GUIState {
+    // fn handle_sync_event(&mut self, event: SyncEvent) -> Command<Message> {
+    //     match event {
+    //         SyncEvent::SyncStarted { from, to } => {
+    //             self.sync_status = Some(SyncEvent::SyncProgress {
+    //                 current: from,
+    //                 target: to,
+    //                 percentage: 0.0,
+    //             });
+    //         }
+    //         SyncEvent::SyncProgress {
+    //             current,
+    //             target,
+    //             percentage,
+    //         } => {
+    //             self.sync_status = Some(SyncEvent::SyncProgress {
+    //                 current: current,
+    //                 target: target,
+    //                 percentage,
+    //             });
+    //         }
+    //         SyncEvent::SyncCompleted => {
+    //             self.sync_status = Some(SyncEvent::SyncCompleted);
+
+    //             // When sync completes, refresh relevant UI data
+    //             return Command::batch(vec![
+    //                 self.fetch_work_items(),
+    //                 self.fetch_proposals(),
+    //                 self.fetch_active_works(),
+    //             ]);
+    //         }
+    //         SyncEvent::SyncFailed => {
+    //             self.sync_status = Some(SyncEvent::SyncFailed);
+    //         }
+    //     }
+    //     Command::none()
+    // }
+
+    fn update_sync_ui(&mut self) -> Command<Message> {
+        match &self.sync_status {
+            Some(SyncEvent::SyncStarted { from, to }) => {
+                self.sync_progress_message =
+                    format!("Starting sync at block {} with target {}", from, to);
+            }
+            Some(SyncEvent::SyncProgress { percentage, .. }) => {
+                self.sync_progress_message = format!("Syncing: {:.1}%", percentage);
+            }
+            Some(SyncEvent::SyncCompleted) => {
+                self.sync_progress_message = "Up to date".to_string();
+            }
+            Some(SyncEvent::SyncFailed) => {
+                self.sync_progress_message = "Sync failed.".to_string();
+            }
+            Some(SyncEvent::SyncAhead) => {
+                self.sync_progress_message = "Waiting for initial sync.".to_string();
+            }
+            None => {
+                self.sync_progress_message = if self.node_running {
+                    "Waiting for initial sync."
+                } else {
+                    "Node is disconnected."
+                }.to_string();
+            }
+        }
+        Command::none()
+    }
+
     #[allow(dead_code)]
     fn get_solution_input(&self, work_id: &str) -> String {
         self.active_work_solutions
@@ -666,7 +856,8 @@ impl ConodeCLI {
         Command::perform(
             async move {
                 if let Some(node) = node {
-                    match node.list_active_work().await {
+                    let node_lock = node.lock().await;
+                    match node_lock.list_active_work().await {
                         Ok(works) => {
                             let logger_guard = logger.lock().await;
                             if let Some(logger) = logger_guard.as_ref() {
@@ -678,7 +869,7 @@ impl ConodeCLI {
                                     .await;
                             }
 
-                            let solutions = node
+                            let solutions = node_lock
                                 .active_work_with_solutions(works.clone())
                                 .await
                                 .unwrap();
@@ -706,14 +897,28 @@ impl ConodeCLI {
         )
     }
 
-    fn fetch_proposals(&mut self) -> Command<Message> {
+    fn fetch_discovered_task(&self) -> Command<Message> {
+        let node = self.node.clone();
+        // let logger = Arc::clone(&self.logger);
+
+        Command::perform(async move {
+            if let Some(node) = node {
+                let task = node.lock().await.list_task().await;
+                task
+            } else {
+                Vec::new()
+            }
+        }, Message::TaskDiscovered)
+    }
+
+    fn fetch_proposals(&self) -> Command<Message> {
         let node = self.node.clone();
         let logger = Arc::clone(&self.logger);
 
         Command::perform(
             async move {
                 if let Some(node) = node {
-                    match node.list_proposals().await {
+                    match node.lock().await.list_proposals().await {
                         Ok(proposals) => {
                             let logger_guard = logger.lock().await;
                             if let Some(logger) = logger_guard.as_ref() {
@@ -747,34 +952,24 @@ impl ConodeCLI {
         )
     }
 
-    fn start_node(&mut self) -> Command<Message> {
-        if let Some(mut node) = self.node.clone() {
+    /// Starts the GUI including beginning the node run() task, assigning the node the node runner
+    /// and agregating node logs.
+    fn start_node(&mut self) {
+        if let Some(node) = self.node.clone() {
             let (_, rx) = mpsc::channel::<(String, LogLevel)>(100);
-            let logger = Arc::clone(&self.logger);
+            self.toolbar_buttons_state.connect.set_title("Stop Working".to_string());
 
-            let runner = tokio::spawn(async move {
-                if let Err(e) = node.run().await {
-                    let logger_guard = logger.lock().await;
-                    if let Some(logger) = logger_guard.as_ref() {
-                        logger
-                            .log(LogLevel::Error, format!("Node error: {:?}", e))
-                            .await;
-                    }
-                } else {
-                    let logger_guard = logger.lock().await;
-                    if let Some(_logger) = logger_guard.as_ref() {
-                        if let Some(logger) = logger_guard.as_ref() {
-                            logger.log(LogLevel::Info, "Node stopped".to_string()).await;
-                        }
-                    }
-                }
+            tokio::spawn(async move {   
+                    let mut cs_node = node.lock().await;
+                    let _ = cs_node.initial_setup().await;
+                    cs_node.monitor().await;
             });
-
-            self.node_runner = Some(runner);
 
             self.node_running = true;
 
-            Command::perform(
+            let _ = self.fetch_work_items();
+
+            let _ = Command::perform(
                 async move {
                     ReceiverStream::new(rx)
                         .map(|(msg, level)| Message::AddLog(msg, level))
@@ -782,11 +977,11 @@ impl ConodeCLI {
                         .await
                 },
                 Message::BatchLog,
-            )
+            );
         } else {
             let logger = Arc::clone(&self.logger);
 
-            Command::perform(
+            let _ = Command::perform(
                 async move {
                     let logger_guard = logger.lock().await;
                     if let Some(logger) = logger_guard.as_ref() {
@@ -798,60 +993,85 @@ impl ConodeCLI {
                             .await;
                     }
                 },
-                // async move {
-                //     if let Ok(logger_guard) = logger.lock().await {
-                //         if let Some(logger) = logger_guard.as_ref() {
-                //             logger.log(
-                //                 LogLevel::Error,
-                //                 "Failed to start node: No node instance available".to_string()
-                //             ).await;
-                //         }
-                //     }
-                // },
                 |_| Message::Noop,
-            )
+            );
         }
     }
 
     fn fetch_work_items(&mut self) -> Command<Message> {
-        let node = self.node.clone();
-        let logger = Arc::clone(&self.logger);
+        // let node = self.node.clone();
+        // let logger = Arc::clone(&self.logger);
 
-        Command::perform(
-            async move {
-                if let Some(node) = node {
-                    match node.list_work_opportunities().await {
-                        Ok(items) => {
-                            let logger_guard = logger.lock().await;
-                            if let Some(logger) = logger_guard.as_ref() {
-                                logger
-                                    .log(
-                                        LogLevel::Info,
-                                        format!("Fetched {} work items", items.len()),
-                                    )
-                                    .await;
-                            }
-                            items
-                        }
-                        Err(e) => {
-                            let logger_guard = logger.lock().await;
-                            if let Some(logger) = logger_guard.as_ref() {
-                                logger
-                                    .log(
-                                        LogLevel::Error,
-                                        format!("Failed to fetch work items: {}", e),
-                                    )
-                                    .await;
-                            }
-                            Vec::new()
-                        }
-                    }
-                } else {
-                    Vec::new()
-                }
+        let work_broadcast_json = r#"
+        {
+            "work": {
+                "id": "work_123",
+                "proposal_id": null,
+                "proposal_signatures": null,
+                "details": {
+                    "description": "Example work task",
+                    "requirements": ["Python", "Machine Learning"],
+                    "expiry_date": null,
+                    "reward": 1000,
+                    "status": "GOod"
+                },
+                "worker_address": null,
+                "employer_address": "0x1234567890abcdef"
             },
-            |items| Message::WorkItemsFetched(items),
-        )
+            "peer_info": {
+                "peer_id": "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN",
+                "connected_addr": "/ip4/127.0.0.1/tcp/8080",
+                "last_seen": 1682956800,
+                "is_dedicated": false
+            }
+        }"#;
+        
+        let work_broadcast: WorkBroadcast = serde_json::from_str(work_broadcast_json).unwrap();
+        
+        let mut itas = Vec::new();
+        itas.push(work_broadcast);
+
+        self.validated_task_broadcast = itas;
+        Command::none()
+
+        // UNDO
+
+        // Command::perform(
+        //     async move {
+        //         if let Some(node) = node {
+                    
+        //             match node.lock().await.list_work_opportunities().await {
+        //                 Ok(items) => {
+        //                     let logger_guard = logger.lock().await;
+        //                     if let Some(logger) = logger_guard.as_ref() {
+        //                         logger
+        //                             .log(
+        //                                 LogLevel::Info,
+        //                                 format!("Fetched {} work items", items.len()),
+        //                             )
+        //                             .await;
+        //                     }
+        //                     items
+        //                 }
+        //                 Err(e) => {
+        //                     let logger_guard = logger.lock().await;
+        //                     if let Some(logger) = logger_guard.as_ref() {
+        //                         logger
+        //                             .log(
+        //                                 LogLevel::Error,
+        //                                 format!("Failed to fetch work items: {}", e),
+        //                             )
+        //                             .await;
+        //                     }
+        //                     Vec::new()
+        //                 }
+        //             }
+        //         } else {
+        //             Vec::new()
+        //         }
+        //     },
+        //     |items| Message::WorkItemsFetched(items),
+        // )
     }
 }
 
@@ -867,12 +1087,13 @@ async fn main() -> iced::Result {
         .filter(Some("wgpu"), log::LevelFilter::Error)
         .init();
 
-    let _settings = Settings::with_flags(Arc::clone(&logger_arc));
+    // Define settings for the window
     let mut settings = Settings::with_flags(Arc::clone(&logger_arc));
-    settings.window.size = (600, 600);
-    settings.window.resizable = false;
+    settings.window.size = (1366, 930); 
+    settings.window.resizable = true;
+    settings.window.position = Position::Specific(0, 0);
 
-    match ConodeCLI::run(settings) {
+    match GUIState::run(settings) {
         Ok(_) => Ok(()),
         Err(e) => Err(e),
     }

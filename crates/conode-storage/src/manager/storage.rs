@@ -1,22 +1,28 @@
+use conode_config::configuration_exporter::ConfigurationExporter;
 use conode_types::negotiation::Negotiation;
-use rocksdb::{Direction, IteratorMode, DB};
+use conode_types::sync::SyncRange;
+use rocksdb::{
+    BoundColumnFamily, ColumnFamilyDescriptor, Direction, Error, IteratorMode, Options, DB,
+};
+use std::future::Future;
 use starknet::core::types::Felt;
+use std::{collections::HashMap};
 use std::sync::Arc;
-use std::{collections::HashMap, error::Error};
 
 use crate::error::{StoreError, WorkManagerError};
 use conode_logging::logger::log_info;
 use conode_types::work::{ActiveWork, PendingItem, Work, WorkBroadcast};
 
+
 /// Storage manager for handling persistent data storage using RocksDB.
 /// Manages work items, proposals, and blockchain sync state.
-#[derive(Debug, Clone)]
-pub struct StorageManager {
+#[derive(Debug)]
+pub struct InMemoryDb {
     /// The underlying RocksDB instance
-    db: Arc<DB>,
+    db: DB,
 }
 
-impl StorageManager {
+impl InMemoryDb {
     /// Creates a new StorageManager instance with the provided RocksDB database.
     ///
     /// # Arguments
@@ -24,8 +30,62 @@ impl StorageManager {
     ///
     /// # Returns
     /// * `Result<Self, WorkManagerError>` - New StorageManager instance or error
-    pub fn new(db: Arc<DB>) -> Result<Self, WorkManagerError> {
-        Ok(StorageManager { db })
+    pub fn new() -> Result<Self, WorkManagerError> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+
+        let cf_names = vec![
+            "jobs",
+            "user_jobs",
+            "proposals",
+            "broadcasted_task",
+            "active_jobs",
+            "active_work",
+            "broadcasted_work",
+            "work_submissions",
+            "work_salt",
+            "solutions",
+            "solution_salts",
+            "solution_hashes",
+            "metadata",
+        ];
+
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = cf_names
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+            .collect();
+
+        let configuration = ConfigurationExporter::new()
+            .map_err(|e| WorkManagerError::Internal(format!("{}", e.to_string())))?;
+        let data_dir = configuration.config.data_dir;
+
+        // We only wrap the DB in Arc since it's specifically designed for shared access
+        let db = DB::open_cf_descriptors(&opts, data_dir, cf_descriptors).map_err(|e| WorkManagerError::Internal(e.to_string()))?;
+
+        Ok(InMemoryDb { db })
+    }
+
+    /// Updates the sync range column family with a new range
+    ///
+    /// # Aguments
+    /// * `range` - The new [`SyncRange`] to store
+    ///
+    /// # Returns
+    /// * Result(()) Returns an empty result if successful
+    /// * StoreError Returns a [`StoreError`] if err
+    pub fn insert_sync_range(&self, range: SyncRange) -> Result<(), StoreError> {
+        let cf = self
+            .db
+            .cf_handle("sync_ranges")
+            .expect("expect cf_handle sync_ranges to exist");
+        let range_key = format!("{}:{}", range.start, range.end);
+
+        let r = self.db.iterator_cf(&cf, IteratorMode::Start);
+
+        self.db
+            .put_cf(&cf, range_key, bincode::serialize(&range)?)
+            .map_err(|e| StoreError::Database(e))
     }
 
     /// Stores the latest synchronized block number.
@@ -35,9 +95,19 @@ impl StorageManager {
     ///
     /// # Returns
     /// * Result(()) if put() returns successful or StoreError if a storage error occurs.
-    pub fn store_synced_block(&self, block_number: u64) -> Result<(), StoreError> {
+    pub fn update_latest_synced_block_num(&self, block_number: u64) -> Result<(), StoreError> {
+        println!("Updaitng the db");
+        let cf = self
+            .db
+            .cf_handle("metadata")
+            .expect("expected cf_handle metadata to exist");
+
         self.db
-            .put("synced_block_number", block_number.to_string().as_bytes())
+            .put_cf(
+                &cf,
+                "latest_synced_block",
+                block_number.to_string().as_bytes(),
+            )
             .map_err(|e| StoreError::Database(e))
     }
 
@@ -45,8 +115,13 @@ impl StorageManager {
     ///
     /// # Returns
     /// * `u64` - Last synced block number, or 0 if none found
-    pub fn get_synced_block(&self) -> u64 {
-        match self.db.get("synced_block_number") {
+    pub fn latest_synced_block(&self) -> u64 {
+        let cf = self
+            .db
+            .cf_handle("metadata")
+            .expect("expected cf_handle metadata to exist");
+
+        match self.db.get_cf(&cf, "latest_synced_block") {
             Ok(Some(value)) => {
                 // Parse block number from stored value
                 String::from_utf8(value).unwrap().parse().unwrap_or(0)
@@ -79,6 +154,26 @@ impl StorageManager {
         Ok(())
     }
 
+    pub fn broadcasted_work(&self) -> Result<Vec<WorkBroadcast>, StoreError> {
+        let cf_handle = self.db.cf_handle("broadcasted_work");
+        let mut tasks = Vec::new();
+
+        if cf_handle.is_some() {
+            let task_bytes: Vec<_> = self.db.full_iterator_cf(&cf_handle.unwrap(), IteratorMode::End).collect();
+            for bytes in task_bytes {
+                let (key_bytes, val_bytes) = bytes?;
+                match bincode::deserialize(&val_bytes) {
+                    Ok(task) => {
+                        tasks.push(task);
+                    }
+                    _ => {}
+                }
+            }
+        } 
+
+        Ok(tasks)
+    }
+
     /// Stores a potential work item received from the network.
     ///
     /// # Arguments
@@ -94,7 +189,7 @@ impl StorageManager {
             is_marked_for_save: false,
         };
 
-        let cf_handle = self.db.cf_handle("gossiped_work");
+        let cf_handle = self.db.cf_handle("broadcasted_task");
 
         if cf_handle.is_some() {
             match bincode::serialize(&pending_item) {
@@ -115,7 +210,7 @@ impl StorageManager {
     /// * `Result<Vec<WorkBroadcast>, StoreError>` - List of work broadcasts or error
     pub fn get_work(&self) -> Result<Vec<WorkBroadcast>, StoreError> {
         let mut works = Vec::new();
-        let cf_handle = self.db.cf_handle("gossiped_work");
+        let cf_handle = self.db.cf_handle("broadcasted_task");
 
         if cf_handle.is_some() {
             let iter = self
@@ -136,7 +231,7 @@ impl StorageManager {
             return Ok(works);
         }
 
-        Err(StoreError::ColumnFamilyNotFound("gossiped_work"))
+        Err(StoreError::ColumnFamilyNotFound("broadcasted_task"))
     }
 
     /// Retrieves all active work items.
@@ -245,6 +340,11 @@ impl StorageManager {
         }
     }
 
+    pub async fn remove_proposal(&self, negotiation_id: String) -> Result<(), Box<dyn std::error::Error>> {
+        let key = format!("proposals:{}", negotiation_id);
+        Ok(self.db.delete(key)?)
+    }
+
     /// Retrieves a proposal by its ID.
     ///
     /// # Arguments
@@ -255,7 +355,7 @@ impl StorageManager {
     pub fn get_proposal_by_id(
         &self,
         negotiation_id: &str,
-    ) -> Result<Option<Negotiation>, Box<dyn Error>> {
+    ) -> Result<Option<Negotiation>, Box<dyn std::error::Error>> {
         let prefix = "proposals:";
         let iter = self
             .db
@@ -283,9 +383,7 @@ impl StorageManager {
     ///
     /// # Returns
     /// * `Result<Vec<Negotiation>, Box<dyn Error + Send + Sync>>` - List of proposals or error
-    pub async fn get_all_proposals(
-        &self,
-    ) -> Result<Vec<Negotiation>, Box<dyn Error + Send + Sync>> {
+    pub async fn get_all_proposals(&self) -> Result<Vec<Negotiation>, WorkManagerError> {
         let mut proposals = Vec::new();
         let prefix = b"proposals:";
 
@@ -293,14 +391,14 @@ impl StorageManager {
             .db
             .iterator(IteratorMode::From(prefix, Direction::Forward));
         for item in iter {
-            let (key, value) = item?;
+            let (key, value) = item.map_err(|e| WorkManagerError::JobNotFound(e.to_string()))?;
             if !key.starts_with(prefix) {
                 break;
             }
 
             match bincode::deserialize::<Negotiation>(&value) {
                 Ok(proposal) => proposals.push(proposal),
-                Err(e) => return Err(e),
+                Err(e) => return Err(WorkManagerError::Internal("".to_string())),
             }
         }
 
@@ -353,15 +451,16 @@ impl StorageManager {
         &self,
         work_id: String,
         solution: String,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), WorkManagerError> {
         // Get handle for solutions column family
         let cf_handle = self
             .db
             .cf_handle("solutions")
-            .ok_or("Column family 'solutions' not found")?;
+            .ok_or("Column family 'solutions' not found")
+            .map_err(|e| WorkManagerError::Internal(e.to_string()))?;
 
         // Store the solution with work ID as key
-        self.db.put_cf(&cf_handle, work_id, solution)?;
+        self.db.put_cf(&cf_handle, work_id, solution).map_err(|e| WorkManagerError::DatabaseError(e.to_string()));
 
         Ok(())
     }
@@ -374,12 +473,17 @@ impl StorageManager {
     ///
     /// # Returns
     /// * `Result<(), Box<dyn Error>>` - Success or error
-    pub fn store_work_salt(&self, work_id: String, salt: String) -> Result<(), Box<dyn Error>> {
+    pub fn store_work_salt(
+        &self,
+        work_id: String,
+        salt: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Get handle for salts column family
         let cf_handle = self
             .db
             .cf_handle("solution_salts")
-            .ok_or("Column family 'solution_salts' not found")?;
+            .ok_or("Column family 'solution_salts' not found")
+            .map_err(|e| WorkManagerError::Internal(e.to_string()))?;
 
         // Store the salt with work ID as key
         self.db.put_cf(&cf_handle, work_id.as_bytes(), salt)?;
@@ -399,12 +503,12 @@ impl StorageManager {
         &self,
         work_id: String,
         submission_hash: Felt,
-    ) -> Result<(), Box<dyn Error>> {
-        // Use a dedicated column family for submissions
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let cf_handle = self
             .db
             .cf_handle("solution_hashes")
-            .ok_or("Column family 'solution_hashes' not found")?;
+            .ok_or("Column family 'solution_hashes' not found")
+            .map_err(|e| WorkManagerError::Internal(e.to_string()))?;
 
         // Store the submission hash with the work ID as key
         self.db.put_cf(
@@ -426,11 +530,12 @@ impl StorageManager {
     pub fn get_work_submission(
         &self,
         work_id: &str,
-    ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let cf_handle = self
             .db
             .cf_handle("solutions")
-            .ok_or("Column family 'solutions' not found")?;
+            .ok_or("Column family 'solutions' not found")
+            .map_err(|e| WorkManagerError::Internal(e.to_string()))?;
 
         match self.db.get_cf(&cf_handle, work_id.as_bytes())? {
             Some(bytes) => Ok(Some(bincode::deserialize(bytes.as_slice())?)),
@@ -448,12 +553,11 @@ impl StorageManager {
     pub fn get_work_submissions(
         &self,
         works: &Vec<ActiveWork>,
-    ) -> Result<HashMap<String, Option<String>>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<HashMap<String, Option<String>>, Box<dyn std::error::Error>> {
         let mut submissions_map = HashMap::new();
 
         for work in works.iter() {
             let submission = self.get_work_submission(&work.work.id.clone())?;
-
             submissions_map.insert(work.work.id.to_owned(), submission);
         }
 

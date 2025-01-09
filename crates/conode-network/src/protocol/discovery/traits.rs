@@ -14,7 +14,7 @@ pub trait Discoverer {
     /// A future that resolves to the boolean indicating if the broadcast was handled correctly
     /// or not.
     fn handle_potential_work(
-        &mut self,
+        &self,
         work: &WorkBroadcast,
         message: &GossipsubMessage,
     ) -> impl std::future::Future<Output = Result<bool, Box<dyn Error>>> + Send;

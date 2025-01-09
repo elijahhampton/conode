@@ -1,35 +1,37 @@
 use crate::app::messages::Message;
-use crate::types::enums::View;
-use crate::ui::styles::button::{ActionButtonStyle, OutlinedButtonStyle};
-use crate::ui::styles::container::ProposalItemStyle;
-use conode_types::negotiation::{Negotiation, ProposalStatus};
-use iced::alignment::{Horizontal, Vertical};
-use iced::widget::{Button, Column, Container, Row, Scrollable, Space, Text};
+use crate::ui::styles::component::ProposalItemStyle;
+use crate::GUIState;
+use conode_types::negotiation::Negotiation;
+use iced::widget::{Button, Column, Container, Row, Scrollable, Text};
 use iced::{theme, Alignment, Color, Element, Length};
 use libp2p::PeerId;
+use crate::ui::func::gui::traits::create::CreateComponent;
 
 pub trait ProposalView {
     fn proposals(&self) -> &Vec<Negotiation>;
     fn local_peer_id(&self) -> PeerId;
-    fn create_centered_container<'a>(&self, content: Element<'a, Message>) -> Element<'a, Message>;
+    fn create_proposal_item_view<'a>(&self, proposal: &'a Negotiation) -> Element<'a, Message>;
+    fn get_proposal_action(&self, proposal: &Negotiation) -> Option<(String, Message)>;
+    fn proposals_view(&self) -> Element<Message>;
 
-    fn create_button<'a>(&self, label: &'a str, message: Message) -> Button<'a, Message> {
-        Button::new(
-            Text::new(label)
-                .horizontal_alignment(Horizontal::Center)
-                .vertical_alignment(Vertical::Center),
-        )
-        .width(Length::Fixed(200.0))
-        .padding(15)
-        .style(theme::Button::Custom(Box::new(OutlinedButtonStyle)))
-        .on_press(message)
+}
+
+impl ProposalView for GUIState {
+    fn proposals(&self) -> &Vec<Negotiation> {
+        &self.proposals
     }
+
+    fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id.expect("Local peer ID should be set") // Using the existing field
+    }
+
+
 
     fn get_proposal_action(&self, proposal: &Negotiation) -> Option<(String, Message)> {
         let is_employer = self.local_peer_id() == proposal.employer;
 
         match &proposal.status {
-            Some(ProposalStatus::Proposed) => {
+            Some(conode_types::negotiation::ProposalStatus::Proposed) => {
                 if is_employer {
                     // Employer can acknowledge the proposal
                     Some((
@@ -42,7 +44,7 @@ pub trait ProposalView {
                 }
             }
 
-            Some(ProposalStatus::Acknowledged) => {
+            Some(conode_types::negotiation::ProposalStatus::Acknowledged) => {
                 if is_employer {
                     // Employer can sign the proposal
                     Some((
@@ -54,7 +56,7 @@ pub trait ProposalView {
                 }
             }
 
-            Some(ProposalStatus::EmployerSigned(_)) => {
+            Some(conode_types::negotiation::ProposalStatus::EmployerSigned(_)) => {
                 if !is_employer {
                     // Worker can countersign
                     Some((
@@ -66,7 +68,7 @@ pub trait ProposalView {
                 }
             }
 
-            Some(ProposalStatus::FullySigned { .. }) => {
+            Some(conode_types::negotiation::ProposalStatus::FullySigned { .. }) => {
                 if is_employer {
                     // Employer can create the work on chain
                     Some((
@@ -78,7 +80,7 @@ pub trait ProposalView {
                 }
             }
 
-            Some(ProposalStatus::Error(_error)) => {
+            Some(conode_types::negotiation::ProposalStatus::Error(_error)) => {
                 // Show error status but no action
                 None
             }
@@ -92,11 +94,21 @@ pub trait ProposalView {
         let role_text = if is_employer { "Employer" } else { "Worker" };
 
         let status_color = match &proposal.status {
-            Some(ProposalStatus::Proposed) => Color::from_rgb(1.0, 0.8, 0.0),
-            Some(ProposalStatus::Acknowledged) => Color::from_rgb(0.0, 0.8, 1.0),
-            Some(ProposalStatus::EmployerSigned(_)) => Color::from_rgb(0.5, 0.8, 0.5),
-            Some(ProposalStatus::FullySigned { .. }) => Color::from_rgb(0.0, 1.0, 0.0),
-            Some(ProposalStatus::Error(_)) => Color::from_rgb(1.0, 0.0, 0.0),
+            Some(conode_types::negotiation::ProposalStatus::Proposed) => {
+                Color::from_rgb(1.0, 0.8, 0.0)
+            }
+            Some(conode_types::negotiation::ProposalStatus::Acknowledged) => {
+                Color::from_rgb(0.0, 0.8, 1.0)
+            }
+            Some(conode_types::negotiation::ProposalStatus::EmployerSigned(_)) => {
+                Color::from_rgb(0.5, 0.8, 0.5)
+            }
+            Some(conode_types::negotiation::ProposalStatus::FullySigned { .. }) => {
+                Color::from_rgb(0.0, 1.0, 0.0)
+            }
+            Some(conode_types::negotiation::ProposalStatus::Error(_)) => {
+                Color::from_rgb(1.0, 0.0, 0.0)
+            }
             None => Color::from_rgb(0.5, 0.5, 0.5),
         };
 
@@ -135,7 +147,7 @@ pub trait ProposalView {
                 Row::new()
                     .push(Text::new("Status:").size(14).style(Color::WHITE))
                     .push(
-                        Text::new(format!("{:?}", proposal.status))
+                        Text::new(std::format!("{:?}", proposal.status))
                             .size(14)
                             .style(status_color),
                     )
@@ -155,20 +167,25 @@ pub trait ProposalView {
             );
         }
 
-        // Add action button if available
         if let Some((button_text, message)) = self.get_proposal_action(proposal) {
             content = content.push(
-                Row::new().push(Space::with_width(Length::Fill)).push(
-                    Button::new(Text::new(button_text).size(12).style(Color::WHITE))
-                        .style(theme::Button::Custom(Box::new(ActionButtonStyle)))
-                        .padding([6, 12])
-                        .on_press(message),
-                ),
+                Row::new()
+                    .push(iced::widget::Space::with_width(Length::Fill))
+                    .push(
+                        Button::new(Text::new(button_text).size(12).style(Color::WHITE))
+                            .style(theme::Button::Custom(Box::new(
+                                crate::ui::styles::button::ActionButtonStyle,
+                            )))
+                            .padding([6, 12])
+                            .on_press(message),
+                    ),
             );
         }
 
         Container::new(content)
-            .style(theme::Container::Custom(Box::new(ProposalItemStyle)))
+            .style(theme::Container::Custom(Box::new(
+                ProposalItemStyle,
+            )))
             .padding(10)
             .width(Length::Fill)
             .into()
@@ -189,15 +206,15 @@ pub trait ProposalView {
             .height(Length::Fill)
             .width(Length::Fill);
 
-        let back_button = self.create_button("Back", Message::NavigateTo(View::Options));
+  
 
         let content = Column::new()
             .push(Text::new("Active Proposals").size(24).style(Color::WHITE))
             .push(scrollable_content)
-            .push(back_button)
             .spacing(20)
             .align_items(Alignment::Center);
 
+        // Use ProposalView's create_centered_container explicitly
         self.create_centered_container(content.into())
     }
 }

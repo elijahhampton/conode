@@ -1,10 +1,13 @@
-use crate::network::CoNodeNetwork;
+use crate::network::Network;
 use crate::protocol::discovery::traits::Seeker;
+use crate::protocol::discovery::work_discovery_topic;
 use crate::protocol::negotiation::traits::Negotiator;
 
+use conode_storage::error::WorkManagerError;
 use conode_types::peer::PeerInfo;
 
 use conode_types::traits::libp2p::GossipsubNodeProvider;
+use conode_types::work::FlattenedWork;
 use conode_types::{
     negotiation::{Negotiation, NegotiationRequest, NegotiationResponse},
     work::WorkBroadcast,
@@ -17,13 +20,44 @@ use libp2p::{
     request_response::{InboundRequestId, OutboundRequestId, ResponseChannel},
     Multiaddr, PeerId,
 };
+use libp2p_kad::RoutingUpdate;
 use log::{error, warn};
 use std::time::Duration;
 use std::{error::Error, sync::Arc};
 use tokio::sync::{
-    mpsc::{self, UnboundedSender},
+    mpsc::{self, Sender},
     oneshot, Mutex,
 };
+
+use conode_storage::traits::{Storage, StorageDefault, StorageWithDefault};
+
+pub trait NetworkStorage: Send + Sync + 'static {
+    fn as_storage(&self) -> &dyn Storage;
+}
+
+impl Storage for Box<dyn NetworkStorage> {
+    fn get_key(&self, key: &[u8], cf_name: Option<&str>) -> Result<Option<Vec<u8>>, WorkManagerError> {
+        self.as_storage().get_key(key, cf_name)
+    }
+
+    fn put_key(&self, key: &[u8], value: &[u8], cf_name: Option<&str>) -> Result<(), WorkManagerError> {
+        self.as_storage().put_key(key, value, cf_name)
+    }
+
+    fn delete_key(&self, key: &[u8], cf_name: Option<&str>) -> Result<(), WorkManagerError> {
+        self.as_storage().delete_key(key, cf_name)
+    }
+
+    fn batch_write(&self, cf_name: Option<&str>, batch: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Result<(), WorkManagerError> {
+        self.as_storage().batch_write(cf_name, batch)
+    }
+}
+
+impl<T: Storage + Send + Sync + 'static> NetworkStorage for T {
+    fn as_storage(&self) -> &dyn Storage {
+        self
+    }
+}
 
 /// An interface to the underlying CoNodeNetwork.
 #[derive(Clone)]
@@ -36,9 +70,9 @@ pub struct NetworkHandle {
 /// that relays messages to the network for further handling.
 struct NetworkInner {
     /// The network instance
-    network: Arc<Mutex<CoNodeNetwork>>,
+    network: Arc<Mutex<Network>>,
     /// Channel to send messages to the network manager
-    to_manager_tx: UnboundedSender<NetworkHandleMessage>,
+    to_manager_tx: Sender<NetworkHandleMessage>,
 }
 
 #[derive(Debug)]
@@ -97,71 +131,55 @@ pub enum NetworkHandleMessage {
 
 impl NetworkHandle {
     /// Creates a new instance of NetworkHandle
-    pub fn new(network: Arc<Mutex<CoNodeNetwork>>) -> Self {
-        let (to_manager_tx, mut to_manager_rx) = mpsc::unbounded_channel();
-
+    pub fn new(network: Arc<Mutex<Network>>) -> Self {
+        let (to_manager_tx, mut to_manager_rx) = mpsc::channel(100); 
+    
         let inner = Arc::new(NetworkInner {
             network: network.clone(),
             to_manager_tx,
         });
-
+    
         let handle = Self {
             inner: inner.clone(),
         };
-
-        let handle_clone = handle.clone();
-
-        // Spawn a new thread to continuously handle swarm and network events.
+    
+        // Improve network event handling
+        let network_clone = inner.network.clone();
         tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    // First branch: handle events from the swarm
-                    swarm_event = async {
-                        // Here we acquire the lock only to get the next event
-                        let next_event = {
-                            let mut network = handle_clone.inner.network.lock().await;
-                            network.swarm.select_next_some().await
-                        };
-                        // The network lock is released here while we process the event
-                        next_event
-                    } => {
-                        if let Err(e) = network.lock().await.handle_swarm_event(swarm_event).await {
-                            warn!("Error handling swarm event: {:?}", e);
-                        }
-
+                match tokio::time::timeout(
+                    Duration::from_secs(300),
+                    network_clone.lock()
+                ).await {
+                    Ok(mut network_guard) => {
+                        let event = network_guard.get_next_event().await;
+                        network_guard.handle_swarm_event(event).await;
                     }
-                    // Second branch: handle incoming messages
-                    Some(msg) = to_manager_rx.recv() => {
-                        handle_clone.handle_message(msg).await;
+                    Err(e) => {
+                        error!("Failed to acquire network lock: {:?}", e);
+                        tokio::time::sleep(Duration::from_secs(120)).await;
                     }
-                    // Frequently sleep this loop to allow other parts of the application
-                    // to lock the swarm.
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => (),
-                    else => break,
                 }
             }
         });
-
+    
         handle
     }
-
+    
     /// Add new listener
     pub async fn add_listener(&self, listener_id: ListenerId, addr: Multiaddr) {
-        let _ = self
-            .inner
-            .to_manager_tx
-            .send(NetworkHandleMessage::AddListener(listener_id, addr));
+        self.inner.network.lock().await.swarm.lock().await.listen_on(addr);
     }
 
     /// Start listening on address
     pub async fn start_listening(&self, addr: Multiaddr) -> Result<(), Box<dyn Error + Send>> {
         let mut network = self.inner.network.lock().await;
-        let _ = network.swarm.listen_on(addr);
+        let _ = network.swarm.lock().await.listen_on(addr);
         Ok(())
     }
 
     pub async fn peer_info(&self) -> Result<PeerInfo, Box<dyn Error>> {
-        Ok(self.inner.network.lock().await.peer_info())
+        Ok(self.inner.network.lock().await.peer_info().await)
     }
 
     /// Handle negotiation request
@@ -172,15 +190,7 @@ impl NetworkHandle {
         request: NegotiationRequest,
         channel: ResponseChannel<NegotiationResponse>,
     ) {
-        let _ = self
-            .inner
-            .to_manager_tx
-            .send(NetworkHandleMessage::HandleNegotiationRequest {
-                from,
-                request_id,
-                request,
-                channel,
-            });
+        self.inner.network.lock().await.handle_negotiation_request(from, request_id, request, channel);
     }
 
     /// Handle negotiation response
@@ -189,13 +199,7 @@ impl NetworkHandle {
         request_id: OutboundRequestId,
         response: NegotiationResponse,
     ) {
-        let _ = self
-            .inner
-            .to_manager_tx
-            .send(NetworkHandleMessage::HandleNegotiationResponse {
-                request_id,
-                response,
-            });
+        self.inner.network.lock().await.handle_negotiation_response(request_id, response);
     }
 
     /// Handle gossipsub message
@@ -209,15 +213,9 @@ impl NetworkHandle {
     }
 
     /// Send completion confirmation acknowledgement
-    pub fn send_completion_confirmation_ack(&mut self, to: &PeerId, work_id: String, uri: String) {
-        let _ =
-            self.inner
-                .to_manager_tx
-                .send(NetworkHandleMessage::SendCompletionConfirmationAck {
-                    to: *to,
-                    work_id,
-                    solution_uri: uri,
-                });
+    pub async fn send_completion_confirmation_ack(&self, to: &PeerId, work_id: String, uri: String) {
+        let mut network = self.inner.network.lock().await.swarm.lock().await.behaviour_mut()
+        .conode.negotiation_protocol.send_request(to, NegotiationRequest::CompletionAcknowledgement(to.to_string(), work_id, uri));
     }
 
     /// Join gossip protocol
@@ -228,10 +226,7 @@ impl NetworkHandle {
 
     /// Broadcast work to the network
     pub async fn broadcast_work(&self, work: WorkBroadcast) {
-        let _ = self
-            .inner
-            .to_manager_tx
-            .send(NetworkHandleMessage::BroadcastWork(work));
+        self.inner.clone().network.lock().await.broadcast_work(&work);
     }
 
     /// Initiate negotiation with a peer
@@ -239,27 +234,14 @@ impl NetworkHandle {
         &self,
         recipient: PeerId,
         job_id: String,
-        negotiation: Negotiation,
+        negotiation: &mut Negotiation,
     ) {
-        let _ = self
-            .inner
-            .to_manager_tx
-            .send(NetworkHandleMessage::InitiateNegotiation {
-                recipient,
-                job_id,
-                negotiation,
-            });
+        self.inner.clone().network.lock().await.initiate_negotiation(&recipient, &job_id, negotiation).await;
     }
 
     /// Request completion acknowledgement
     pub async fn request_completion_ack(&self, recipient: PeerId, negotiation: Negotiation) {
-        let _ = self
-            .inner
-            .to_manager_tx
-            .send(NetworkHandleMessage::RequestCompletionAck {
-                recipient,
-                negotiation,
-            });
+        self.inner.network.lock().await.request_completion_ack(&recipient, negotiation);
     }
 
     /// Send completion confirmation request
@@ -268,168 +250,50 @@ impl NetworkHandle {
         recipient: PeerId,
         negotiation: String,
     ) {
-        let _ = self.inner.to_manager_tx.send(
-            NetworkHandleMessage::SendCompletionConfirmationRequest {
-                recipient,
-                negotiation,
-            },
-        );
+        self.inner.network.lock().await.send_completion_confirmation_request(&recipient, &negotiation);
     }
 
     /// Subscribe to a topic
     pub async fn subscribe(&self, topic: String) {
-        let _ = self
-            .inner
-            .to_manager_tx
-            .send(NetworkHandleMessage::Subscribe(topic));
+        self.inner.network.lock().await.swarm.lock().await.behaviour_mut().conode.gossipsub.subscribe(&work_discovery_topic());
     }
 
     /// Unsubscribe from a topic
     pub async fn unsubscribe(&self, topic: String) {
-        let _ = self
-            .inner
-            .to_manager_tx
-            .send(NetworkHandleMessage::Unsubscribe(topic));
+        self.inner.network.lock().await.swarm.lock().await.behaviour_mut().conode.gossipsub.unsubscribe(&work_discovery_topic());
     }
 
     /// Shutdown the network
-    pub async fn shutdown(&self) -> Result<(), oneshot::error::RecvError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .inner
-            .to_manager_tx
-            .send(NetworkHandleMessage::Shutdown(tx));
-        rx.await
+    pub async fn shutdown(&self) {
+        self.inner.network.lock().await.shutdown();
     }
 
     /// Get the local PeerId
     pub async fn local_peer_id(&self) -> PeerId {
-        *self.inner.network.lock().await.swarm.local_peer_id()
+        *self.inner.network.lock().await.swarm.lock().await.local_peer_id()
     }
 
-    pub async fn add_peer_to_kademlia_dht(&self, peer_id: &PeerId, address: Multiaddr) {
+    pub async fn local_peer_info(&self) -> PeerInfo {
+        self.inner.network.lock().await.peer_info().await
+    }
+
+    pub async fn add_peer_to_kademlia_dht(&self, peer_id: &PeerId, address: Multiaddr) -> Result<RoutingUpdate, Box<dyn Error>> {
         let mut network = self.inner.network.lock().await;
-        // We don't handle the routing update here. The network will receive a swarm event
-        // with the routing update if successful.
-        let _ = network
+
+        let routing_update = network
             .swarm
-            .behaviour_mut()
+            .lock().await.behaviour_mut()
             .conode
             .kademlia
             .add_address(peer_id, address);
+
+        Ok(routing_update)
     }
 
     pub async fn bootstrap_kademlia(&self) {
-        let mut network = self.inner.network.lock().await;
+        let network = self.inner.network.lock().await;
         // We don't handle the routing update here. The network will receive a swarm event
         // with the routing update if successful.
-        let _ = network.swarm.behaviour_mut().conode.kademlia.bootstrap();
-    }
-}
-
-impl NetworkHandle {
-    /// Process a received network handle message
-    pub async fn handle_message(&self, msg: NetworkHandleMessage) {
-        match msg {
-            NetworkHandleMessage::BroadcastWork(work) => {
-                let mut network = self.inner.network.lock().await;
-                let _ = network.broadcast_work(&work).await;
-            }
-            NetworkHandleMessage::InitiateNegotiation {
-                recipient,
-                job_id,
-                mut negotiation,
-            } => {
-                let mut network = self.inner.network.lock().await;
-                let _ = network
-                    .initiate_negotiation(&recipient, &job_id, &mut negotiation)
-                    .await;
-            }
-            NetworkHandleMessage::RequestCompletionAck {
-                recipient,
-                negotiation,
-            } => {
-                let mut network = self.inner.network.lock().await;
-                network
-                    .request_completion_ack(&recipient, negotiation)
-                    .await;
-            }
-            NetworkHandleMessage::SendCompletionConfirmationRequest {
-                recipient,
-                negotiation,
-            } => {
-                let mut network = self.inner.network.lock().await;
-                network
-                    .send_completion_confirmation_request(&recipient, &negotiation)
-                    .await;
-            }
-            NetworkHandleMessage::SendCompletionConfirmationAck {
-                to,
-                work_id,
-                solution_uri,
-            } => {
-                let mut network = self.inner.network.lock().await;
-                network
-                    .send_completion_confirmation_ack(&to, work_id, solution_uri)
-                    .await;
-            }
-            NetworkHandleMessage::HandleNegotiationRequest {
-                from,
-                request_id,
-                request,
-                channel,
-            } => {
-                let mut network = self.inner.network.lock().await;
-                network
-                    .handle_negotiation_request(from, request_id, request, channel)
-                    .await;
-            }
-            NetworkHandleMessage::HandleNegotiationResponse {
-                request_id,
-                response,
-            } => {
-                let mut network = self.inner.network.lock().await;
-                network
-                    .handle_negotiation_response(request_id, response)
-                    .await;
-            }
-            NetworkHandleMessage::HandleGossipsubMessage(message) => {
-                let mut network = self.inner.network.lock().await;
-                let _ = network.handle_gossipsub_message(message).await;
-            }
-            NetworkHandleMessage::Subscribe(topic) => {
-                let mut network = self.inner.network.lock().await;
-                let _ = network
-                    .swarm
-                    .behaviour_mut()
-                    .conode
-                    .gossipsub
-                    .subscribe(&Sha256Topic::new(topic));
-            }
-            NetworkHandleMessage::Unsubscribe(topic) => {
-                let mut network = self.inner.network.lock().await;
-                let _ = network
-                    .swarm
-                    .behaviour_mut()
-                    .conode
-                    .gossipsub
-                    .unsubscribe(&Sha256Topic::new(topic));
-            }
-            NetworkHandleMessage::AddListener(_listener_id, _addr) => {}
-            NetworkHandleMessage::StartListening(addr) => {
-                let mut network = self.inner.network.lock().await;
-                let _ = network.swarm.listen_on(addr);
-            }
-            NetworkHandleMessage::JoinGossipProtocol => {
-                let mut network = self.inner.network.lock().await;
-                let _ = network.join_gossip_protocol();
-            }
-            NetworkHandleMessage::Shutdown(sender) => {
-                if let Err(e) = self.inner.network.lock().await.shutdown().await {
-                    error!("Network did not shutdown successfully {}", e.to_string());
-                }
-                let _ = sender.send(());
-            }
-        }
+        let _ = network.swarm.lock().await.behaviour_mut().conode.kademlia.bootstrap();
     }
 }

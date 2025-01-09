@@ -2,9 +2,10 @@ use std::borrow::Borrow;
 use std::future::Future;
 use std::str::FromStr;
 use std::{error::Error, sync::Arc};
+use std::collections::HashMap;
 
 use crate::behaviour::DistributedBehaviour;
-use crate::connection::{ListenerCloseReason, NetworkConnectionHandler};
+use crate::connection::{ NetworkConnectionHandler};
 use crate::event::{CoNodeEvent, DistributedBehaviourEvent};
 use crate::peer::peer_connection::{PeerConnection, PeerManager};
 use crate::protocol::{
@@ -14,11 +15,14 @@ use crate::protocol::{
     },
     negotiation::traits::Negotiator,
 };
-
+use crate::request::RequestHandler;
+use crate::peer::peer_connection::ListenerCloseReason;
 use chrono::DateTime;
+use conode_config::configuration_exporter::ConfigurationExporter;
 use conode_logging::logger::{log_info, log_warning};
 use conode_starknet::crypto::keypair::KeyPair;
-use conode_storage::state::{SharedState, SharedStateArc};
+use conode_storage::manager::chain::ChainContext;
+use conode_storage::manager::storage::{InMemoryDb};
 use conode_types::crypto::{ECDSASignature, FeltWrapper};
 use conode_types::negotiation::ProposalStatus;
 use conode_types::peer::PeerInfo;
@@ -29,6 +33,9 @@ use conode_types::{
     negotiation::{Negotiation, NegotiationRequest, NegotiationResponse},
     work::{FlattenedWork, Work, WorkBroadcast},
 };
+use futures::{SinkExt, StreamExt};
+use libp2p::autonat::{InboundFailure, OutboundFailure};
+use libp2p::dcutr::outbound;
 use libp2p::gossipsub::SubscriptionError;
 use libp2p::request_response::Event as RequestResponseEvent;
 use libp2p::swarm::SwarmEvent;
@@ -47,41 +54,98 @@ use starknet::core::types::Felt;
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
-use crate::handle::{NetworkHandle, NetworkHandleMessage};
+use thiserror::Error;
 
-/// Provides the core network implementation of the protocol. All functionality related to
-/// related to peer interaction (Gossip, Kademlia, RequestResponse and all distributed behaviours) is
-/// handled by the CoNodeNetwork.
-pub struct CoNodeNetwork {
-    pub swarm: Swarm<DistributedBehaviour>,
-    shared_state: SharedStateArc,
-    peer_manager: PeerManager,
-    connection_handler: NetworkConnectionHandler,
-    keypair: KeyPair,
+use crate::handle::{NetworkHandle, NetworkHandleMessage, NetworkStorage};
+
+/// A context for inbound/outbound request used to map the request id to
+/// a context.
+#[derive(Clone, Debug, Copy)]
+pub enum InboundOutboundContext {
+    InboundNegotiation,
+    OutboundNegotiation,
+    OutboundRequestCompletion,
+    OutboundCompletionConfirmation,
+    OutboundCompletionAcknowledgement
 }
 
-impl CoNodeNetwork {
-    pub async fn new(
-        swarm: Swarm<DistributedBehaviour>,
-        shared_state: Arc<tokio::sync::Mutex<SharedState>>,
-        keypair: KeyPair,
-    ) -> anyhow::Result<(NetworkHandle, mpsc::UnboundedReceiver<NetworkHandleMessage>)> {
-        // @dev Note this is an unbounded mpsc channel
-        let (_network_tx, network_rx) = mpsc::unbounded_channel();
 
+/// A status for inbound/outbound request/response states.
+#[derive(Debug)]
+pub enum InboundOutboundState {
+    // Represents a successful inbound or outbound request/response.
+    Success,
+    /// Represents an inbound or outbound request/response in an error state.
+    InboundError(InboundFailure),
+    /// Represents an inbound or outbound request/response in an error state.
+    OutboundError(OutboundFailure)
+}
+
+#[derive(Error, Debug)]
+pub enum NetworkError {
+    #[error("Duplicate inbound id exist in network map")]
+    ExistingInboundId,
+    #[error("Duplicate outbound id exist in network map")]
+    ExistingOutboundId,
+    #[error("Network request failed")]
+    RequestFailed,
+    #[error("Max retries succeeded")]
+    MaxRetriesExceeded
+}
+
+/// Provides the core network implementation of the protocol. All functionality related to
+/// related to peer interaction (Gossip, RequestResponse and all distributed behaviours) is
+/// handled by [`Network`].
+pub struct Network {
+    /// Instance of the swarm
+    pub swarm: Arc<Mutex<Swarm<DistributedBehaviour>>>,
+    /// A chain context for Starknet
+    chain_context: Arc<tokio::sync::RwLock<ChainContext>>,
+    /// An in memory db
+    pub mem_db: Arc<tokio::sync::Mutex<InMemoryDb>>,
+    // A peer manager
+    peer_manager: PeerManager,
+    // An application Keypair
+    keypair: KeyPair,
+    // Context for an outbound request id
+    pub outbound_context: HashMap<OutboundRequestId, InboundOutboundContext>,
+    pub outbound_proposals: Arc<tokio::sync::Mutex<HashMap<OutboundRequestId, Negotiation>>>,
+    pub config: ConfigurationExporter,
+    request_handler: RequestHandler<Box<dyn NetworkStorage>>,
+    disk_db: Box<dyn NetworkStorage>
+}
+
+impl Network {
+    pub async fn new(
+        swarm: Arc<Mutex<Swarm<DistributedBehaviour>>>,
+        keypair: KeyPair,
+        chain_context: Arc<tokio::sync::RwLock<ChainContext>>,
+        mem_db: Arc<tokio::sync::Mutex<InMemoryDb>>,
+        config: ConfigurationExporter,
+        request_handler: RequestHandler<Box<dyn NetworkStorage>>,
+        disk_db: Box<dyn NetworkStorage>
+    ) -> anyhow::Result<(NetworkHandle, mpsc::UnboundedReceiver<NetworkHandleMessage>)> {
+        let (_network_tx, network_rx) = mpsc::unbounded_channel();
+    
         let network = Arc::new(Mutex::new(Self {
             swarm,
-            shared_state: shared_state.clone(),
             peer_manager: PeerManager::new(),
-            connection_handler: NetworkConnectionHandler::new(),
             keypair: keypair.clone(),
+            chain_context,
+            mem_db,
+            outbound_context: HashMap::new(),
+            outbound_proposals: Arc::new(Mutex::new(HashMap::new())),
+            config,
+            disk_db,
+            request_handler
         }));
 
-        // We return a network handle which will serve as an interface into the
-        // network.
         let handle = NetworkHandle::new(network);
-
         Ok((handle, network_rx))
+    }
+
+    pub async fn get_next_event(&self) -> SwarmEvent<DistributedBehaviourEvent> {
+        self.swarm.lock().await.select_next_some().await
     }
 
     // Handles events emitted from libp2p swarm.
@@ -89,6 +153,8 @@ impl CoNodeNetwork {
         &mut self,
         event: SwarmEvent<DistributedBehaviourEvent>,
     ) -> Result<(), Box<dyn Error>> {
+        let mut swarm = self.swarm.lock().await;
+
         match event {
             SwarmEvent::Behaviour(behaviour) => match behaviour {
                 DistributedBehaviourEvent::CoNode(conode_event) => {
@@ -128,8 +194,7 @@ impl CoNodeNetwork {
                 },
                 DistributedBehaviourEvent::AutoNat(_event) => {
                     info!("[AutoNat::Event]: For future use");
-                } // DistributedBehaviourEvent::Relay(_) => todo("For future use"),
-                  // DistributedBehaviourEvent::Dcutr(_) => todo("For future user")
+                } 
             },
             SwarmEvent::ConnectionEstablished {
                 peer_id,
@@ -160,7 +225,7 @@ impl CoNodeNetwork {
                 listener_id,
                 address,
             } => {
-                self.connection_handler
+                self.peer_manager
                     .new_listen_addr(listener_id, address)
                     .await;
             }
@@ -169,13 +234,13 @@ impl CoNodeNetwork {
                 address,
             } => {
                 // Expire the address
-                self.connection_handler
-                    .expire_address(listener_id, &address)
-                    .await;
+                // self.peer_manager
+                //     .expire_address(listener_id, &address)
+                //     .await;
 
                 // Attempt to reconnect
-                if let Ok(listener_id) = self.swarm.listen_on(address.clone()) {
-                    self.connection_handler
+                if let Ok(listener_id) = swarm.listen_on(address.clone()) {
+                    self.peer_manager
                         .new_listen_addr(listener_id, address)
                         .await;
                 }
@@ -186,13 +251,13 @@ impl CoNodeNetwork {
                 reason: _,
             } => {
                 let _ = self
-                    .connection_handler
+                    .peer_manager
                     .close_listener(listener_id, ListenerCloseReason::Done)
                     .await;
             }
             SwarmEvent::ListenerError { listener_id, error } => {
                 let _ = self
-                    .connection_handler
+                    .peer_manager
                     .set_listener_error(listener_id, error)
                     .await;
             }
@@ -202,7 +267,7 @@ impl CoNodeNetwork {
     }
 
     /// Handles events related to the CoNode protocol including: Gossipsub and RequestResponse.
-    async fn handle_conode_event(&mut self, event: CoNodeEvent) -> Result<(), Box<dyn Error>> {
+    async fn handle_conode_event(&self, event: CoNodeEvent) -> Result<(), Box<dyn Error>> {
         match event {
             CoNodeEvent::NegotiationRequestResponse(event) => match event {
                 RequestResponseEvent::Message { peer, message } => match message {
@@ -221,16 +286,20 @@ impl CoNodeNetwork {
                         self.handle_negotiation_response(request_id, response).await;
                     }
                 },
-                _ => {}
+                RequestResponseEvent::OutboundFailure { peer, request_id, error } => {
+      
+                    
+                }
+                RequestResponseEvent::InboundFailure { peer, request_id, error } => todo!(),
+                RequestResponseEvent::ResponseSent { peer, request_id } => todo!(),
+                
             },
             CoNodeEvent::Kademlia(event) => {
-                // Handle all Kad events through the peer manager
                 self.peer_manager.handle_kad_event(event).await;
             }
             CoNodeEvent::Mdns(event) => {
                 let event_clone = event.clone();
 
-                // First handle connections in the peer manager
                 self.peer_manager.handle_mdns_event(event).await;
 
                 // Update kademlia if needed
@@ -238,7 +307,7 @@ impl CoNodeNetwork {
                     libp2p::mdns::Event::Discovered(discovered_nodes) => {
                         for node in discovered_nodes.clone().iter() {
                             self.swarm
-                                .behaviour_mut()
+                                .lock().await.behaviour_mut()
                                 .conode
                                 .kademlia
                                 .add_address(&node.0, node.1.clone());
@@ -247,7 +316,7 @@ impl CoNodeNetwork {
                     libp2p::mdns::Event::Expired(expired_nodes) => {
                         for node in expired_nodes.iter() {
                             self.swarm
-                                .behaviour_mut()
+                                .lock().await.behaviour_mut()
                                 .conode
                                 .kademlia
                                 .remove_address(&node.0, &node.1.clone());
@@ -263,37 +332,23 @@ impl CoNodeNetwork {
                 } => {
                     let _ = self.handle_gossipsub_message(message).await;
                 }
-                libp2p::gossipsub::Event::Subscribed { peer_id, topic } => {
-                    info!(
-                        "[new peer subscription] peer {} subcribed to topic {}",
-                        peer_id.to_string(),
-                        topic.into_string()
-                    );
-                }
-                libp2p::gossipsub::Event::Unsubscribed { peer_id, topic } => {
-                    info!(
-                        "peer {} unsubscribed from topic {}",
-                        peer_id.to_string(),
-                        topic.into_string()
-                    );
-                }
-                _ => {}
+                 _ => {}
             },
         }
         Ok(())
     }
 
     /// Returns the peer info for this network
-    pub fn peer_info(&self) -> PeerInfo {
+    pub async fn peer_info(&self) -> PeerInfo {
         let connected_addr = Some(
             self.swarm
-                .listeners()
+                .lock().await.listeners()
                 .next()
                 .map(|addr| addr.clone())
                 .unwrap_or(Multiaddr::empty()),
         );
         PeerInfo {
-            peer_id: self.swarm.local_peer_id().clone(),
+            peer_id: self.swarm.lock().await.local_peer_id().clone(),
             connected_addr: connected_addr,
             last_seen: DateTime::from_timestamp_nanos(0),
             is_dedicated: false,
@@ -303,47 +358,48 @@ impl CoNodeNetwork {
     /// Shutdown the network.
     pub async fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
         // Close all listeners
-        let listener_ids: Vec<_> = self
-            .connection_handler
-            .listener_statuses
-            .lock()
-            .await
-            .keys()
-            .cloned()
-            .collect();
+        // let listener_ids: Vec<_> = self
+        //     .peer_manager
+        //     .listener_statuses
+        //     .lock()
+        //     .await
+        //     .keys()
+        //     .cloned()
+        //     .collect();
 
-        for id in listener_ids {
-            self.swarm.remove_listener(id);
-        }
+        // for id in listener_ids {
+        //     self.swarm.remove_listener(id);
+        // }
 
-        let peers: Vec<_> = self.swarm.connected_peers().cloned().collect();
+        // let peers: Vec<_> = self.swarm.connected_peers().cloned().collect();
 
-        // Disconnect and remove all peers from the KADHT
-        for peer in peers {
-            if let Err(e) = self.swarm.disconnect_peer_id(peer) {
-                log::warn!("Failed to disconnect from peer {}: {:?}", peer, e);
-            }
+        // // Disconnect and remove all peers from the KADHT
+        // for peer in peers {
+        //     if let Err(e) = self.swarm.disconnect_peer_id(peer) {
+        //         log::warn!("Failed to disconnect from peer {}: {:?}", peer, e);
+        //     }
 
-            self.swarm
-                .behaviour_mut()
-                .conode
-                .kademlia
-                .remove_peer(&peer);
-        }
+        //     self.swarm
+        //         .behaviour_mut()
+        //         .conode
+        //         .kademlia
+        //         .remove_peer(&peer);
+        // }
 
-        // Clear any pending messages/state
-        self.connection_handler.clear_state().await;
+        // // Clear any pending messages/state
+        // self.peer_manager.clear_state().await;
 
-        log::info!("Network shutdown completed");
+        // log::info!("Network shutdown completed");
+        // Ok(())
         Ok(())
     }
 }
 
-impl Discoverer for CoNodeNetwork {
+impl Discoverer for Network {
     /// Checks to see if potential work items from `WorkBroadcast` match the nodes criteria. This function
     /// acts as a filtering mechanism storing only eligible work items.
     fn handle_potential_work(
-        &mut self,
+        &self,
         work: &WorkBroadcast,
         _message: &GossipsubMessage,
     ) -> impl std::future::Future<Output = Result<bool, Box<dyn Error>>> + Send {
@@ -352,24 +408,24 @@ impl Discoverer for CoNodeNetwork {
                 return Ok(false);
             }
 
-            // Eventually this will need to batch multiple work items.
-            let shared_state = self.shared_state.lock().await;
-            let _ = shared_state
-                .storage_manager
-                .add_potential_work(work.clone());
-
+            let _ = self.mem_db.lock().await.add_potential_work(work.clone())?;
             Ok(true)
         }
     }
 
-    /// Returns true or false based on how the node defines
-    /// eligible `Work`.
-    fn is_matching_node_critera(&self, _work: &Work) -> bool {
+    /// Returns true or false based on how the node config defines the [`TaskCriteria`].
+    fn is_matching_node_critera(&self, task: &Work) -> bool {
+        // Ensure reward meets the minimum reward configuration
+        let reward = task.details.reward.unwrap_or(0);
+        if (reward < self.config.config.task.min_reward) {
+            return false;
+        }
+
         true
     }
 }
 
-impl Seeker for CoNodeNetwork {
+impl Seeker for Network {
     /// Broadcast work to the network under the work discovery topic. Peers will have access to
     /// work information and peer info.
     fn broadcast_work<'a>(
@@ -379,7 +435,7 @@ impl Seeker for CoNodeNetwork {
         async move {
             let publish_result = self
                 .swarm
-                .behaviour_mut()
+                .lock().await.behaviour_mut()
                 .conode
                 .gossipsub
                 .publish(work_discovery_topic(), bincode::serialize(data).unwrap());
@@ -388,10 +444,9 @@ impl Seeker for CoNodeNetwork {
                 Ok(_) => {
                     // Add the successfully broadcasted item to the db
                     let _ = self
-                        .shared_state
+                        .mem_db
                         .lock()
                         .await
-                        .storage_manager
                         .add_broadcasted_work(data.work.clone());
 
                     true
@@ -411,38 +466,40 @@ impl Seeker for CoNodeNetwork {
     }
 }
 
-impl Negotiator for CoNodeNetwork {
+impl Negotiator for Network {
     /// Initiate a negotiation with a peer.
     async fn initiate_negotiation(
         &mut self,
         recipient: &PeerId,
         _job_id: &String,
         negotiation: &mut Negotiation,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), NetworkError> {
+
+
         // Set the correct negotiation status
         assert!(negotiation.status == None);
         negotiation.status = Some(ProposalStatus::Proposed);
 
         // Create a new proposal
         let new_proposal_request = NegotiationRequest::NewProposal(
-            self.swarm.local_peer_id().clone(),
+            self.swarm.lock().await.local_peer_id().clone(),
             negotiation.clone(),
         );
 
         let _ = self
-            .shared_state
+            .mem_db
             .lock()
             .await
-            .storage_manager
-            .save_or_update_proposal(&negotiation)
-            .await;
+            .save_or_update_proposal(&negotiation).await;
 
-        self.swarm
-            .behaviour_mut()
+        let outbound_req_id = self.swarm
+            .lock().await.behaviour_mut()
             .conode
             .negotiation_protocol
             .send_request(recipient, new_proposal_request);
 
+
+   
         Ok(())
     }
 
@@ -450,14 +507,11 @@ impl Negotiator for CoNodeNetwork {
     /// Sign the negotiation and send an EDCSA keypair in order to recover the public key on chain
     async fn request_completion_ack(&mut self, recipient: &PeerId, mut negotiation: Negotiation) {
         let (signature, _storage_result) = {
-            let shared_state = self.shared_state.lock().await;
             let negotiation_hash = Felt::from_bytes_be_slice(negotiation.id.as_bytes());
 
             // Run both operations under one lock
-            let signature = shared_state
-                .chain_manager
-                .sign(self.keypair.stark_private_key(), &negotiation_hash)
-                .await;
+            let signature =
+                ChainContext::sign(self.keypair.stark_private_key(), &negotiation_hash).await;
 
             match signature {
                 Some(signature) => {
@@ -471,8 +525,10 @@ impl Negotiator for CoNodeNetwork {
                     negotiation.status =
                         Some(ProposalStatus::EmployerSigned(ecdsa_signature.clone()));
 
-                    let storage_result = shared_state
-                        .storage_manager
+                    let storage_result = self
+                        .mem_db
+                        .lock()
+                        .await
                         .save_or_update_proposal(&negotiation)
                         .await
                         .map_err(|e| e.to_string());
@@ -492,7 +548,7 @@ impl Negotiator for CoNodeNetwork {
         };
 
         let request_completion_ack_request = NegotiationRequest::RequestCompletionAcknowledgement(
-            self.swarm.local_peer_id().clone(),
+            self.swarm.lock().await.local_peer_id().clone(),
             negotiation.id.clone(),
             self.keypair.stark_public_key().clone().into(),
             signature,
@@ -500,7 +556,7 @@ impl Negotiator for CoNodeNetwork {
 
         let _outbound_request_id = self
             .swarm
-            .behaviour_mut()
+            .lock().await.behaviour_mut()
             .conode
             .negotiation_protocol
             .send_request(recipient, request_completion_ack_request);
@@ -513,8 +569,7 @@ impl Negotiator for CoNodeNetwork {
         recipient: &PeerId,
         negotiation_id: &String,
     ) {
-        let shared_state = self.shared_state.lock().await;
-        let negotiation = shared_state.storage_manager.get_proposal(&negotiation_id);
+        let negotiation = self.mem_db.lock().await.get_proposal(&negotiation_id);
 
         if let Some(active_negotiation) = negotiation {
             // We unwrap the address and signatures or simply assign None, expecting the
@@ -552,12 +607,14 @@ impl Negotiator for CoNodeNetwork {
             let active_work_entry = ActiveWork {
                 role: JobRole::Employer,
                 work: created_work_data.clone(),
-                employer_peer_id: self.peer_info().peer_id,
+                employer_peer_id: self.peer_info().await.peer_id,
                 worker_peer_id: recipient.to_owned(),
             };
 
-            if shared_state
-                .storage_manager
+            if self
+                .mem_db
+                .lock()
+                .await
                 .store_active_work(active_work_entry)
                 .is_err()
             {
@@ -571,7 +628,7 @@ impl Negotiator for CoNodeNetwork {
             // to the chain.
             let _request = self
                 .swarm
-                .behaviour_mut()
+                .lock().await.behaviour_mut()
                 .conode
                 .negotiation_protocol
                 .send_request(
@@ -592,10 +649,10 @@ impl Negotiator for CoNodeNetwork {
         work_id: String,
         uri: String,
     ) {
-        let shared_state = self.shared_state.lock().await;
-
-        let active_work = shared_state
-            .storage_manager
+        let active_work = self
+            .mem_db
+            .lock()
+            .await
             .get_active_work_by_id(work_id.clone())
             .map_err(|e| e.to_string());
 
@@ -640,10 +697,9 @@ impl Negotiator for CoNodeNetwork {
 
                     // Store the computed salt and work item
                     let salt_storage_result = self
-                        .shared_state
+                        .mem_db
                         .lock()
                         .await
-                        .storage_manager
                         .store_work_salt(work_id.clone(), salt.to_string())
                         .map_err(|e| e.to_string());
 
@@ -657,10 +713,9 @@ impl Negotiator for CoNodeNetwork {
                     }
 
                     let work_storage_result = self
-                        .shared_state
+                        .mem_db
                         .lock()
                         .await
-                        .storage_manager
                         .store_work_solution(work_id.clone(), uri.to_string())
                         .map_err(|e| e.to_string());
 
@@ -674,10 +729,9 @@ impl Negotiator for CoNodeNetwork {
                     }
 
                     let transaction_result = self
-                        .shared_state
-                        .lock()
+                        .chain_context
+                        .read()
                         .await
-                        .chain_manager
                         .submit_solution(active_work.work.id, p_hash)
                         .await
                         .map_err(|e| e.to_string());
@@ -686,7 +740,7 @@ impl Negotiator for CoNodeNetwork {
                     // network request.
                     if let Ok(_) = transaction_result {
                         self.swarm
-                            .behaviour_mut()
+                            .lock().await.behaviour_mut()
                             .conode
                             .negotiation_protocol
                             .send_request(
@@ -713,32 +767,35 @@ impl Negotiator for CoNodeNetwork {
     /// Request handler for [NegotiationRequest]. See [NegotiationRequest] to learn about
     /// the signifigance of each enum variant.
     async fn handle_negotiation_request(
-        &mut self,
+        &self,
         from: PeerId,
         _request_id: InboundRequestId,
         request: NegotiationRequest,
         channel: ResponseChannel<NegotiationResponse>,
     ) {
+        let mut cs_mutable_swarm = self.swarm.lock().await;
+        let mutable_behaviour = cs_mutable_swarm.behaviour_mut();
         match request {
             NegotiationRequest::NewProposal(_from, mut negotiation) => {
                 negotiation.status = Some(ProposalStatus::Acknowledged);
 
-                let shared_state = self.shared_state.lock().await;
+                let save_or_update_proposal_result = {
+                    let mem_db_lock = self.mem_db.lock().await;
+                    mem_db_lock.save_or_update_proposal(&negotiation).await
+                };
 
-                match shared_state
-                    .storage_manager
-                    .save_or_update_proposal(&negotiation)
-                    .await
-                {
+                match save_or_update_proposal_result {
                     Ok(_) => {
-                        let mutable_swarm = self.swarm.behaviour_mut();
-                        let peer_id = self.shared_state.lock().await.local_peer_id;
+                        let peer_id = self.swarm.lock().await.local_peer_id().clone();
 
                         // We don't handle the response result here as we expect an ResponseResponse::InboundError
                         // if this occurs
-                        let _result = mutable_swarm.conode.negotiation_protocol.send_response(
+                        let _result = mutable_behaviour.conode.negotiation_protocol.send_response(
                             channel,
-                            NegotiationResponse::ProposalAcknowledgement(peer_id, negotiation.id),
+                            NegotiationResponse::ProposalAcknowledgement(
+                                peer_id.to_owned(),
+                                negotiation.id,
+                            ),
                         );
                     }
                     Err(err) => {
@@ -756,10 +813,7 @@ impl Negotiator for CoNodeNetwork {
                 employer_public_key,
                 employer_signature,
             ) => {
-                let shared_state = self.shared_state.lock().await;
-
-                let negotiation_or_none =
-                    shared_state.storage_manager.get_proposal(&negotiation_id);
+                let negotiation_or_none = self.mem_db.lock().await.get_proposal(&negotiation_id);
                 if negotiation_or_none.is_none() {
                     return;
                 }
@@ -767,7 +821,7 @@ impl Negotiator for CoNodeNetwork {
                 let mut negotiation = negotiation_or_none.unwrap();
 
                 let verification_data = Felt::from_bytes_be_slice(negotiation_id.as_bytes());
-                if !shared_state.chain_manager.verify(
+                if !ChainContext::verify(
                     verification_data,
                     employer_public_key.into(),
                     &employer_signature,
@@ -784,10 +838,8 @@ impl Negotiator for CoNodeNetwork {
                 let negotiation_hash = Felt::from_bytes_be_slice(negotiation_id.as_bytes());
 
                 // Use STARK private key for worker signature
-                let worker_signature = shared_state
-                    .chain_manager
-                    .sign(self.keypair.stark_private_key(), &negotiation_hash)
-                    .await;
+                let worker_signature =
+                    ChainContext::sign(self.keypair.stark_private_key(), &negotiation_hash).await;
 
                 if worker_signature.is_none() {
                     log_warning(format!("Unsuccessful signing of proposal.")).await;
@@ -808,8 +860,10 @@ impl Negotiator for CoNodeNetwork {
                         worker_signature: worker_signature.clone(),
                     });
 
-                    if shared_state
-                        .storage_manager
+                    if self
+                        .mem_db
+                        .lock()
+                        .await
                         .save_or_update_proposal(&negotiation)
                         .await
                         .is_err()
@@ -822,32 +876,33 @@ impl Negotiator for CoNodeNetwork {
                     }
 
                     let acknowledgement = NegotiationResponse::AcknowledgementReceived(
-                        self.swarm.local_peer_id().clone(),
+                        self.swarm.lock().await.local_peer_id().clone(),
                         negotiation_id.clone(),
                         worker_signature.clone(),
-                        shared_state.chain_manager.address_as_felt().into(),
+                        self.chain_context.read().await.address_as_felt().into(),
                     );
 
                     let _ = self
                         .swarm
-                        .behaviour_mut()
+                        .lock().await.behaviour_mut()
                         .conode
                         .negotiation_protocol
                         .send_response(channel, acknowledgement);
                 }
             }
             NegotiationRequest::CompletionConfirmation(work) => {
-                let shared_state = self.shared_state.lock().await;
                 let active_work_entry = ActiveWork {
                     work: work.clone(),
                     role: JobRole::Worker,
                     employer_peer_id: from,
-                    worker_peer_id: self.peer_info().peer_id,
+                    worker_peer_id: self.peer_info().await.peer_id,
                 };
 
                 let worker_peer_id = active_work_entry.worker_peer_id.clone();
-                if shared_state
-                    .storage_manager
+                if self
+                    .mem_db
+                    .lock()
+                    .await
                     .store_active_work(active_work_entry)
                     .is_err()
                 {
@@ -861,7 +916,7 @@ impl Negotiator for CoNodeNetwork {
 
                 let _ = self
                     .swarm
-                    .behaviour_mut()
+                    .lock().await.behaviour_mut()
                     .conode
                     .negotiation_protocol
                     .send_response(
@@ -874,7 +929,7 @@ impl Negotiator for CoNodeNetwork {
                 // and properly updated the work submission as of the latest block.
                 let _ = self
                     .swarm
-                    .behaviour_mut()
+                    .lock().await.behaviour_mut()
                     .conode
                     .negotiation_protocol
                     .send_response(channel, NegotiationResponse::SolutionAck);
@@ -885,7 +940,7 @@ impl Negotiator for CoNodeNetwork {
     /// Response handler for [NegotiationResponse]. See [NegotiationResponse] to learn about
     /// the signifigance of each enum variant.
     async fn handle_negotiation_response(
-        &mut self,
+        &self,
         _request_id: OutboundRequestId,
         response: NegotiationResponse,
     ) {
@@ -897,10 +952,8 @@ impl Negotiator for CoNodeNetwork {
                 worker_address,
             ) => {
                 // If we face a critical error here we need to cache this response and
-                let shared_state = self.shared_state.lock().await;
 
-                let negotiation_or_none =
-                    shared_state.storage_manager.get_proposal(&negotiation_id);
+                let negotiation_or_none = self.mem_db.lock().await.get_proposal(&negotiation_id);
 
                 if negotiation_or_none.is_none() {
                     return;
@@ -914,18 +967,15 @@ impl Negotiator for CoNodeNetwork {
                 });
                 negotiation.worker_address = Some(worker_address.into());
 
-                let _ = shared_state
-                    .storage_manager
+                let _ = self
+                    .mem_db
+                    .lock()
+                    .await
                     .save_or_update_proposal(&negotiation.clone())
                     .await;
             }
             NegotiationResponse::ProposalAcknowledgement(_from, negotiation_id) => {
-                let negotiation_or_none = self
-                    .shared_state
-                    .lock()
-                    .await
-                    .storage_manager
-                    .get_proposal(&negotiation_id);
+                let negotiation_or_none = self.mem_db.lock().await.get_proposal(&negotiation_id);
 
                 if negotiation_or_none.is_none() {
                     return;
@@ -935,10 +985,9 @@ impl Negotiator for CoNodeNetwork {
                 negotiation.status = Some(ProposalStatus::Acknowledged);
 
                 let _ = self
-                    .shared_state
+                    .mem_db
                     .lock()
                     .await
-                    .storage_manager
                     .save_or_update_proposal(&negotiation)
                     .await;
             }
@@ -947,13 +996,7 @@ impl Negotiator for CoNodeNetwork {
                 // to be resubmitted to the chain. The on chain time lock algorithm will track the creation date/time of
                 // the work so we can submit this transaction when available and the working node will eventually discard
                 // the negotiation if too much time passes before a creation transaction occurs.
-                let _ = self
-                    .shared_state
-                    .lock()
-                    .await
-                    .chain_manager
-                    .create_work(&work)
-                    .await;
+                let _ = self.chain_context.read().await.create_task(&work).await;
             }
             NegotiationResponse::SolutionAck => {
                 // We don't need to do anything here.
@@ -962,29 +1005,25 @@ impl Negotiator for CoNodeNetwork {
     }
 }
 
-impl GossipsubNodeProvider for CoNodeNetwork {
+impl GossipsubNodeProvider for Network {
     /// Handles gossipsub messages that are published throughout the network.
     fn handle_gossipsub_message(
-        &mut self,
+        &self,
         message: GossipsubMessage,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn Error>>> + Send {
         async move {
-            // For any Work item published in the work discovery topic the network will verify the item meets the
+            // For any task published the network will verify the item meets the
             // nodes work criteria, store the peer for potential future interaction and store the broadcast in a database.
 
             // @dev Future work includes adding a setting to the network configurator allowed the client to accept a max number of
             // broadcast, i.e. opportunities
-            if message.topic == work_discovery_topic().into() {
-                if let Ok(work) = bincode::deserialize::<WorkBroadcast>(&message.data) {
-                    log_info(format!(
-                        "Discovered potential work opportunity from peer {}",
-                        work.peer_info.peer_id.to_string()
-                    ))
+            if let Ok(work) = bincode::deserialize::<WorkBroadcast>(&message.data) {
+                log_info(format!(
+                    "Discovered potential work opportunity from peer {}", work.peer_info.peer_id.to_string()))
                     .await;
                     let _ = self.handle_potential_work(&work, &message).await;
-                } else {
-                    error!("Failed to deserialize work broadcast.");
-                }
+            } else {
+                    log_info(format!("Received a gossipsub message from {}. Unable to deserialize.", message.source.unwrap_or(PeerId::random()))).await;
             }
 
             Ok(())
@@ -998,7 +1037,7 @@ impl GossipsubNodeProvider for CoNodeNetwork {
         async move {
             match self
                 .swarm
-                .behaviour_mut()
+                .lock().await.behaviour_mut()
                 .conode
                 .gossipsub
                 .subscribe(&work_discovery_topic())

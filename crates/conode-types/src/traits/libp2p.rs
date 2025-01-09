@@ -6,7 +6,7 @@ use std::error::Error;
 pub trait GossipsubNodeProvider {
     /// Handles Gossipsub messages for each topic the node is subscribed to.
     fn handle_gossipsub_message(
-        &mut self,
+        & self,
         message: Message,
     ) -> impl std::future::Future<Output = Result<(), Box<dyn Error>>> + Send;
     /// Subscribes the node to a topic.

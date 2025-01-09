@@ -1,12 +1,33 @@
 // src/ui/views/options.rs
 
 use crate::app::messages::Message;
-use iced::widget::{Button, Column, Row};
-use iced::{Alignment, Element};
+use crate::ui::styles::button::OutlinedButtonStyle;
+use crate::GUIState;
+use iced::widget::{Button, Column, Row, Text};
+use iced::{Alignment, Element, Length,  alignment::{Horizontal, Vertical}};
+use iced::theme;
+use crate::ui::func::gui::traits::create::CreateComponent;
 
 pub trait OptionsView {
     fn create_option_button<'a>(&self, label: &'a str, message: Message) -> Button<'a, Message>;
-    fn create_centered_container<'a>(&self, content: Element<'a, Message>) -> Element<'a, Message>;
+    fn options_view(&self) -> Element<Message>
+    where
+        Self: Sized;
+}
+
+impl OptionsView for GUIState {
+    fn create_option_button<'a>(&self, label: &'a str, message: Message) -> Button<'a, Message> {
+        Button::new(
+            Text::new(label)
+                .horizontal_alignment(Horizontal::Center)
+                .vertical_alignment(Vertical::Center),
+        )
+        .width(Length::FillPortion(1))
+        .height(Length::Fixed(100.0))
+        .padding(15)
+        .style(theme::Button::Custom(Box::new(OutlinedButtonStyle)))
+        .on_press(message)
+    }
 
     fn options_view(&self) -> Element<Message>
     where

@@ -8,4 +8,5 @@ pub struct ChainConfig {
     pub payment_token_contract: String,
     pub chain_id: String,
     pub rpc: String,
+    pub deployed_block_num: u64,
 }

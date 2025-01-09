@@ -2,20 +2,10 @@ use config::{Config, ConfigError, File};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RpcConfig {
     pub rpc: String,
     pub chain_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct NodeConfig {
-    pub data_dir: String,
-    pub log_level: String,
-    pub rpc: RpcConfig,
-    pub account: AccountConfig,
-    pub contract: ContractConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -25,8 +15,28 @@ pub struct AccountConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContractConfig {
+    /// Payment token smart contract address
     pub payment_token: String,
+    /// CoNode smart contract address
     pub conode: String,
+    /// The block number containing the DeployTransaction for
+    /// conode smart contracts
+    pub conode_deployment_block: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCriteria {
+    pub min_reward: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NodeConfig {
+    pub data_dir: String,
+    pub log_level: String,
+    pub rpc: RpcConfig,
+    pub account: AccountConfig,
+    pub contract: ContractConfig,
+    pub task: TaskCriteria
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -53,6 +63,14 @@ impl TryFrom<Config> for ConfigurationExporter {
         let contract = ContractConfig {
             payment_token: config.get_string("contract.payment_token")?,
             conode: config.get_string("contract.conode")?,
+            conode_deployment_block: config
+                .get_int("contract.conode_deployment_block")?
+                .try_into()
+                .expect("missing config variable `contract.conode_deployment_block`"),
+        };
+
+        let task = TaskCriteria {
+            min_reward: config.get_int("task_criteria.min_reward")?.try_into().unwrap_or(0)
         };
 
         Ok(ConfigurationExporter {
@@ -62,6 +80,7 @@ impl TryFrom<Config> for ConfigurationExporter {
                 rpc,
                 account,
                 contract,
+                task
             },
         })
     }
@@ -83,7 +102,9 @@ impl Default for ConfigurationExporter {
                 contract: ContractConfig {
                     payment_token: "".to_string(),
                     conode: "".to_string(),
+                    conode_deployment_block: 0,
                 },
+                task: TaskCriteria { min_reward: 0 }
             },
         }
     }

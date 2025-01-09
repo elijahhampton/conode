@@ -1,7 +1,10 @@
 use anyhow::Result;
 use backoff::{backoff::Backoff, ExponentialBackoff};
 use conode_logging::logger::log_warning;
-use conode_types::chain::ChainConfig;
+use conode_types::{
+    chain::ChainConfig,
+    sync::{SyncEvent, SyncRange},
+};
 use starknet::{
     core::{
         types::{BlockId, EmittedEvent, EventFilter, Felt},
@@ -9,33 +12,40 @@ use starknet::{
     },
     providers::Provider,
 };
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use tokio::time::{sleep, Duration};
+use std::sync::{atomic::AtomicBool, Arc};
+use std::{
+    sync::atomic::Ordering,
+};
+use tokio::{
+    sync::Mutex,
+    time::{sleep, Duration},
+};
+use tracing::info;
 use uuid::Uuid;
 
-use super::chain::ChainManager;
-use crate::manager::storage::StorageManager;
-use anyhow::anyhow;
+use super::{chain::ChainContext, storage::InMemoryDb};
+use crate::error::SyncError;
 
 /// SyncManager is responsible for syncing data retrieved from chain events
 /// into the in-memory database. It handles blockchain synchronization and event processing.
-pub struct SyncManager {
+pub struct SyncState {
     /// Atomic flag indicating if a sync operation is in progress
-    is_syncing: AtomicBool,
+    pub is_syncing: AtomicBool,
     /// Manager for chain operations
-    chain_operator: ChainManager,
+    chain_operator: Arc<Mutex<ChainContext>>,
     /// Manager for persistent storage operations
-    storage_manager: StorageManager,
+    storage_manager: Arc<Mutex<InMemoryDb>>,
     // Parameters related to the blockchain
     config: ChainConfig,
     /// Number of blocks to process in each sync chunk
     chunk_size: u64,
-    // TODO: add_mpsc_channel_progress_network_events
-    // event_sender: mpsc::Sender<NetworkEvent>,
+    /// An mpc channel receiver for NetworkEvents
+    pub event_receiver: tokio::sync::watch::Receiver<SyncEvent>,
+    /// An mpc channel sender for NetworkEvents
+    event_sender: tokio::sync::watch::Sender<SyncEvent>,
 }
 
-impl SyncManager {
+impl SyncState {
     /// Initial delay between retry attempts
     const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
     /// Maximum delay between retry attempts
@@ -50,19 +60,19 @@ impl SyncManager {
     /// # Returns
     /// * New SyncManager instance
     pub fn new(
-        storage_manager: StorageManager,
-        chain_operator: ChainManager,
-        config: ChainConfig, // TODO: add_mpsc_channel_progress_network_events
-                             //event_sender: mpsc::Sender<NetworkEvent>
+        storage_manager: Arc<Mutex<InMemoryDb>>,
+        chain_operator: Arc<Mutex<ChainContext>>,
+        config: ChainConfig,
     ) -> Self {
+        let (event_sender, event_receiver) = tokio::sync::watch::channel(SyncEvent::SyncCompleted);
         Self {
             is_syncing: AtomicBool::new(false),
             chain_operator,
             storage_manager,
-            chunk_size: 100,
+            chunk_size: 1000,
             config,
-            // TODO: add_mpsc_channel_progress_network_events
-            //  event_sender,
+            event_sender,
+            event_receiver,
         }
     }
 
@@ -71,16 +81,16 @@ impl SyncManager {
     ///
     /// # Returns
     /// * Result indicating success or error
-    pub async fn sync_to_latest_block(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self
-            .is_syncing
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return Ok(());
-        }
+    pub async fn sync_to_latest_block(&mut self) -> Result<(), SyncError> {
+        println!("sync_to_latest_block");
+        // if !self
+        //     .is_syncing
+        //     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        //     .is_ok()
+        // {
+        //     info!("sync_toffffffffff_latest_block");
+        //     return Ok(());
+        // }
 
         let mut backoff = ExponentialBackoff {
             initial_interval: Self::INITIAL_RETRY_DELAY,
@@ -94,6 +104,7 @@ impl SyncManager {
                 Ok(_) => break Ok(()),
                 Err(e) => {
                     if let Some(retry_delay) = backoff.next_backoff() {
+                        info!("{:?}", e);
                         log_warning(format!(
                             "Sync failed with error: {}. Retrying in {:?}...",
                             e, retry_delay
@@ -120,49 +131,63 @@ impl SyncManager {
         Ok(())
     }
 
-    /// Attempts to sync the local state with the blockchain.
-    /// Processes blocks in chunks to avoid memory pressure.
-    ///
+    /// Attempts to sync blockchain events starting at the deployment block
+    /// of the CoNode WorkCore smart contract.
     /// # Returns
     /// * Result indicating success or error
     async fn attempt_sync(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let latest_block = self
+        
+        let chain_tip = {
+            self
             .chain_operator
+            .lock()
+            .await
             .starknet_provider()
             .provider()
             .block_number()
-            .await?;
-
-        let last_synced = self.storage_manager.get_synced_block();
-
-        if latest_block <= last_synced {
+            .await?
+        };
+        
+        let latest_synced_block_num = self.storage_manager.lock().await.latest_synced_block();
+   
+        if chain_tip <= latest_synced_block_num {
             return Ok(());
         }
 
-        // Calculate chunks
-        let blocks_to_sync = latest_block - last_synced;
-        let chunks = (blocks_to_sync as f64 / self.chunk_size as f64).ceil() as u64;
+        // Calculate blo
+        let blocks_to_sync = chain_tip - latest_synced_block_num;
+        let block_ranges = (blocks_to_sync as f64 / self.chunk_size as f64).ceil() as u64;
 
-        // TODO: add_mpsc_channel_progress_network_events
-        // self.event_sender.send(NetworkEvent::SyncStarted {
-        //     from_block: last_synced,
-        //     to_block: latest_block
-        // }).await?;
+        self.event_sender
+            .send(SyncEvent::SyncStarted {
+                from: latest_synced_block_num,
+                to: chain_tip,
+            })
+            .map_err(|e| SyncError::Internal)?;
 
         // Sync in chunks
-        for chunk in 0..chunks {
-            let start_block = last_synced + (chunk * self.chunk_size) + 1;
-            let end_block = std::cmp::min(start_block + self.chunk_size - 1, latest_block);
+        for range in 0..block_ranges {
+            let current = latest_synced_block_num + (range * self.chunk_size) + 1;
+            let target = std::cmp::min(current + self.chunk_size - 1, chain_tip);
 
-            // TODO: add_mpsc_channel_progress_network_events
-            // self.event_sender.send(NetworkEvent::SyncProgress {
-            //     current_block: start_block,
-            //     target_block: latest_block,
-            //     percentage: ((chunk as f64 + 1.0) / chunks as f64 * 100.0) as u8
-            // }).await?;
+            self.event_sender.send(SyncEvent::SyncProgress {
+                current,
+                target,
+                percentage: ((range as f64 + 1.0) / block_ranges as f64 * 100.0),
+            })?;
 
-            self.process_block_range(start_block, end_block).await?;
+            self.process_block_range(current, target)
+                .await
+                .map_err(|_| SyncError::Internal)?;
+      
         }
+
+        self
+            .storage_manager
+            .lock()
+            .await
+            .update_latest_synced_block_num(chain_tip)?;
+
         Ok(())
     }
 
@@ -175,39 +200,61 @@ impl SyncManager {
     /// # Returns
     /// * Result indicating success or error
     async fn process_block_range(
-        &mut self,
-        start_block: u64,
-        end_block: u64,
+        &self,
+        start: u64,
+        end: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut event_batch = Vec::new();
+
         let conode_contract_address = Felt::from_hex(&self.config.conode_contract).unwrap();
-        for block_num in start_block..=end_block {
-            let events = self
-                .chain_operator
-                .starknet_provider()
-                .provider()
+        let chain_context = self.chain_operator.lock().await;
+
+        let provider = chain_context.starknet_provider().provider();
+
+        let events = provider
+            .get_events(
+                EventFilter {
+                    from_block: Some(BlockId::Number(start)),
+                    to_block: Some(BlockId::Number(end)),
+                    address: Some(conode_contract_address),
+                    keys: None,
+                },
+                None,
+                self.chunk_size,
+            )
+            .await?;
+
+        // We need to check for a continuation token returned by get_events() since the response
+        // is paginated and continue adding each batch to our buffer for processing.
+        event_batch.extend_from_slice(&events.events);
+
+        let mut continuation_token = events.continuation_token;
+        while continuation_token.is_some() {
+            let events_with_continuation = provider
                 .get_events(
                     EventFilter {
-                        from_block: Some(BlockId::Number(block_num)),
-                        to_block: Some(BlockId::Number(block_num)),
+                        from_block: Some(BlockId::Number(start)),
+                        to_block: Some(BlockId::Number(end)),
                         address: Some(conode_contract_address),
                         keys: None,
                     },
-                    None,
+                    continuation_token,
                     self.chunk_size,
                 )
                 .await?;
+            event_batch.extend_from_slice(&events_with_continuation.events);
 
-            for event in events.events {
-                if let Err(e) = self.process_event(event).await {
-                    log_warning(format!(
-                        "Failed to process event in block {}: {}",
-                        block_num, e
-                    ))
-                    .await;
-                }
-            }
+            continuation_token = events_with_continuation.continuation_token;
+        }
 
-            let _ = self.storage_manager.store_synced_block(block_num);
+        Ok(self.process_event_batch(&event_batch).await?)
+    }
+
+    async fn process_event_batch(&self, events: &Vec<EmittedEvent>) -> Result<(), SyncError> {
+     
+
+        for event in events {
+            self.process_event(&event).await?
         }
 
         Ok(())
@@ -218,37 +265,52 @@ impl SyncManager {
     /// and solution verifications.
     ///
     /// # Arguments
-    /// * `event` - The blockchain event to process
+    /// * `event` - The blockchain [`EmittedEvent`] to process
     ///
     /// # Returns
-    /// * Result indicating success or error
-    async fn process_event(&self, event: EmittedEvent) -> Result<()> {
-        let selector_work_submission: Felt =
-            get_selector_from_name("WorkSubmission").unwrap_or(Felt::ZERO);
+    /// * Result(()) An empty result if successful
+    /// * SyncError A [`SyncError`] if err
+    async fn process_event(&self, event: &EmittedEvent) -> Result<(), SyncError> {
+        let chain_context = self.chain_operator.lock().await;
+
+        let selector_work_submission = chain_context
+            .selector_as_felt("WorkSubmission")
+            .unwrap_or(&Felt::ZERO);
 
         match event.keys.get(0) {
             Some(key) => {
-                if *key == selector_work_submission {
-                    let work_id = event
-                        .data
-                        .get(0)
-                        .ok_or_else(|| anyhow!("Missing work ID in WorkSubmission event"))?;
-                    let chain_hash = event
-                        .data
-                        .get(1)
-                        .ok_or_else(|| anyhow!("Missing chain hash in WorkSubmission event"))?;
+                if *key == *selector_work_submission {
+                    let work_id = event.data.get(0).ok_or_else(|| SyncError::Event {
+                        block_number: event.block_number.unwrap(),
+                        address: event.from_address,
+                        context: "missing task_id key".to_string(),
+                    })?;
+                    let chain_hash = event.data.get(1).ok_or_else(|| SyncError::Event {
+                        block_number: event.block_number.unwrap(),
+                        address: event.from_address,
+                        context: "missing chain hash".to_string(),
+                    })?;
 
-                    let work_id_str = work_id.to_string();
-                    let work_id_u128 = work_id_str.parse::<u128>().unwrap();
-                    let uuid = Uuid::from_u128(work_id_u128);
+                    let uuid = Uuid::new_v4(); //FlattenedWork::task_id_felt_to_uuid(*work_id);
 
-                    // Store the submission
-                    let _ = self
-                        .storage_manager
-                        .update_work_submission_hash(uuid.to_string(), chain_hash.to_owned());
+                    let storage = &*self.storage_manager.lock().await;
+                    storage
+                        .update_work_submission_hash(uuid.to_string(), chain_hash.to_owned())
+                        .map_err(|_| SyncError::Event {
+                            block_number: event.block_number.unwrap(),
+                            address: event.from_address,
+                            context: "updating work submission hash failed".to_string(),
+                        })?;
+                    //.map_err(|e| SyncError::Event { block_number: event.block_number.unwrap(), address: event.from_address, context: "updating work submission hash failed".to_string() })?;
                 }
             }
-            None => println!("Event without keys: {:?}", event),
+            None => {
+                return Err(SyncError::Event {
+                    block_number: event.block_number.unwrap(),
+                    address: event.from_address,
+                    context: "abi contains no chain events".to_string(),
+                })
+            }
         }
 
         Ok(())

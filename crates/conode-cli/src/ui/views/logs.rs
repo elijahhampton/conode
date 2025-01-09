@@ -2,17 +2,29 @@
 
 use crate::app::messages::Message;
 use crate::types::enums::View;
+use crate::GUIState;
 use chrono::{Local, Utc};
 use conode_logging::logger::{LogEntry, LogLevel};
 use futures::executor;
 use iced::widget::{Button, Column, Scrollable, Text};
 use iced::{Alignment, Color, Element, Length};
 use tokio::sync::Mutex;
+use crate::ui::func::gui::traits::create::CreateComponent;
 
 pub trait LogsView {
     fn logger(&self) -> &std::sync::Arc<Mutex<Option<conode_logging::logger::AsyncLogger>>>;
-    fn create_button<'a>(&self, label: &'a str, message: Message) -> Button<'a, Message>;
-    fn create_centered_container<'a>(&self, content: Element<'a, Message>) -> Element<'a, Message>;
+    fn logs_view(&self) -> Element<Message>
+    where
+        Self: Sized;
+   
+}
+
+impl LogsView for GUIState {
+    fn logger(
+        &self,
+    ) -> &std::sync::Arc<tokio::sync::Mutex<Option<conode_logging::logger::AsyncLogger>>> {
+        &self.logger
+    }
 
     fn logs_view(&self) -> Element<Message>
     where
@@ -57,12 +69,11 @@ pub trait LogsView {
             .height(Length::Fill)
             .width(Length::Fill);
 
-        let back_button = self.create_button("Back", Message::NavigateTo(View::Options));
 
         let content = Column::new()
             .push(title)
             .push(scrollable_logs)
-            .push(back_button)
+            
             .spacing(20)
             .align_items(Alignment::Center);
 

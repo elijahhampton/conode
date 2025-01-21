@@ -5,32 +5,30 @@ mod network;
 mod types;
 mod ui;
 
-use iced::widget::{container, Button, Column, Container, Row, Text};
-use iced_aw::date_picker::Date;
 use ::libp2p::PeerId;
 use app::messages::Message;
 use app::state::BroadcastFormState;
 use conode_logging::logger::{initialize_logger, log_warning, AsyncLogger, LogLevel};
 use conode_protocol::event::{NetworkEvent, NodeCommand};
-use conode_protocol::labor_market_node::{Node};
+use conode_protocol::labor_market_node::Node;
 use conode_starknet::crypto::keypair::KeyPair;
 use conode_types::negotiation::Negotiation;
 use conode_types::peer::PeerInfo;
 use conode_types::sync::SyncEvent;
 use conode_types::work::{ActiveWork, Work, WorkBroadcast};
-use iced::{subscription, theme, time, Length};
+use iced::widget::{container, Button, Column, Container, Row, Text};
 use iced::window::Position;
+use iced::{subscription, theme, time, Length};
+use iced_aw::date_picker::Date;
 use network::event_stream::EventStream;
 
 use iced::{executor, theme::Theme, Application, Command, Element, Settings};
 use log::info;
 //use network::event_stream::EventStream;
+use crate::ui::styles::button::ModernButtonStyle;
+use crate::ui::styles::component::TaskItemStyle;
+use crate::ui::views::main::MainView;
 use starknet::core::types::Felt;
-use ui::func::gui::traits::create::CreateComponent;
-use ui::state::buttons::ToolbarButtonsState;
-use ui::styles::component::{PaymentBadgeStyle, SyncStatusStyle};
-use ui::styles::container::OuterContainerStyle;
-use ui::views::main::MainContentView;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as TimeDuration;
@@ -40,9 +38,11 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use types::enums::{View, WorkTab};
-use crate::ui::views::main::MainView;
-use crate::ui::styles::component::TaskItemStyle;
-use crate::ui::styles::button::ModernButtonStyle;
+use ui::func::gui::traits::create::CreateComponent;
+use ui::state::buttons::ToolbarButtonsState;
+use ui::styles::component::{PaymentBadgeStyle, SyncStatusStyle};
+use ui::styles::container::OuterContainerStyle;
+use ui::views::main::MainContentView;
 
 /// The state of the iced GUI.
 pub struct GUIState {
@@ -56,7 +56,6 @@ pub struct GUIState {
     // Broadcasted task received through Gossipsub
     validated_task_broadcast: Vec<WorkBroadcast>,
     // Params for the expiry date DatePicker
-
     /// The mnemonic created for new wallets
     mnemonic_words: Vec<String>,
     /// The recovered mnemonic for existing wallets
@@ -90,7 +89,6 @@ pub struct GUIState {
     sync_status: Option<SyncEvent>,
     sync_progress_message: String,
     sync_event_receiver: Option<tokio::sync::watch::Receiver<SyncEvent>>,
-
 }
 
 impl Application for GUIState {
@@ -112,13 +110,11 @@ impl Application for GUIState {
 
         let future = async move {
             match Node::new().await {
-                Ok((node, peer_id, peer_info)) => {
-                    Message::NodeInitialized(
-                        Some(Arc::new(Mutex::new(node))),
-                        Some(peer_id),
-                        Some(peer_info),
-                    )
-                }
+                Ok((node, peer_id, peer_info)) => Message::NodeInitialized(
+                    Some(Arc::new(Mutex::new(node))),
+                    Some(peer_id),
+                    Some(peer_info),
+                ),
                 Err(e) => Message::NodeInitializationFailed(e.to_string()),
             }
         };
@@ -137,7 +133,7 @@ impl Application for GUIState {
                 broadcast_form: BroadcastFormState {
                     reward: String::new(),
                     requirements: String::new(),
-                    description: String::new()
+                    description: String::new(),
                 },
                 current_work_tab: WorkTab::Stored,
                 validated_task_broadcast: Vec::new(),
@@ -151,7 +147,7 @@ impl Application for GUIState {
                 sync_progress_message: "Node initializing...".to_string(),
                 sync_event_receiver: None,
                 sync_status: None,
-                toolbar_buttons_state: ToolbarButtonsState::default()
+                toolbar_buttons_state: ToolbarButtonsState::default(),
             },
             initial_command,
         )
@@ -198,7 +194,7 @@ impl Application for GUIState {
                 let reward = broadcast.work.details.reward;
                 let employer = broadcast.peer_info.peer_id;
                 let peer_info = broadcast.peer_info.clone();
-                let mut negotiation = Negotiation::new(
+                let negotiation = Negotiation::new(
                     Some(peer_info),
                     self.local_peer_info.clone(),
                     employer,
@@ -211,16 +207,13 @@ impl Application for GUIState {
                         node.lock()
                             .await
                             .network
-                            
-                            .initiate_negotiation(recipient, job_id, &mut negotiation)
+                            .initiate_negotiation(recipient, job_id, negotiation)
                             .await;
                     },
                     |_| Message::Noop,
                 )
             }
-            Message::ViewProposals => {
-                self.fetch_proposals()
-            }
+            Message::ViewProposals => self.fetch_proposals(),
             Message::TaskDiscovered(task) => {
                 self.validated_task_broadcast = task;
                 Command::none()
@@ -233,10 +226,7 @@ impl Application for GUIState {
                 self.sync_event_receiver = Some(receiver);
                 Command::perform(async move {}, |_| Message::Noop)
             }
-            Message::OptionsView => {
-               
-                Command::none()
-            }
+            Message::OptionsView => Command::none(),
             Message::SyncEvent(event) => {
                 self.sync_status = Some(event);
                 // let noop_handle_command = self.handle_sync_event(event).await;
@@ -253,7 +243,7 @@ impl Application for GUIState {
                 if let Some(node) = &self.node {
                     let node = Arc::clone(node);
                     let logger = Arc::clone(&self.logger);
-                    
+
                     Command::perform(
                         async move {
                             // Get the receiver inside the async block
@@ -312,18 +302,12 @@ impl Application for GUIState {
             }
 
             Message::NavigateTo(_) => {
-              //  self.current_view = view;
                 Command::none()
             }
-            Message::ViewLogs => {
-              
-                Command::none()
-            }
+            Message::ViewLogs => Command::none(),
             Message::ViewOpportunities => {
-                self.fetch_work_items();
-                info!("FTECHING WOKR ITEMS");
+                let _ = self.fetch_work_items();
                 Command::none()
-           
             }
             Message::WorkItemsFetched(items) => {
                 self.validated_task_broadcast = items;
@@ -338,7 +322,6 @@ impl Application for GUIState {
                 }
             }
             Message::BroadcastWork => {
-              
                 let logger = Arc::clone(&self.logger);
                 Command::perform(
                     async move {
@@ -398,9 +381,7 @@ impl Application for GUIState {
                 )
             }
             Message::Noop => Command::none(),
-            Message::ExpiryDateSelected(expiry) => {
-                Command::none()
-            }
+            Message::ExpiryDateSelected(expiry) => Command::none(),
             Message::RewardChanged(value) => {
                 self.broadcast_form.reward = value;
                 Command::none()
@@ -433,7 +414,7 @@ impl Application for GUIState {
                         async move {
                             if let (Some(node)) = (node) {
                                 let node_lock = node.lock().await;
-                                let peer_info = node_lock.network.peer_info().await.unwrap();
+                                let peer_info = node_lock.network.peer_info().await.to_owned();
 
                                 let work = Work::new(
                                     form_data.description,
@@ -513,7 +494,6 @@ impl Application for GUIState {
                         let node_lock = node.lock().await;
                         node_lock
                             .network
-                        
                             .request_completion_ack(worker_peer_info, negotiation_clone)
                             .await;
                     },
@@ -533,7 +513,6 @@ impl Application for GUIState {
                         node.lock()
                             .await
                             .network
-                   
                             .send_completion_confirmation_request(
                                 proposal.worker_peer_info.unwrap().peer_id,
                                 proposal.id,
@@ -543,10 +522,7 @@ impl Application for GUIState {
                     |_| Message::Noop,
                 )
             }
-            Message::ViewActiveWork => {
-
-                self.fetch_active_works()
-            }
+            Message::ViewActiveWork => self.fetch_active_works(),
             Message::ActiveWorksFetched(works) => {
                 self.active_works = works.0;
                 self.active_work_solutions_submitted = works.1;
@@ -587,9 +563,7 @@ impl Application for GUIState {
                     Command::none()
                 }
             }
-            Message::RestoreFromSeed => {
-                Command::none()
-            }
+            Message::RestoreFromSeed => Command::none(),
             Message::SolutionChanged(work_id, solution) => {
                 self.active_work_solutions.insert(work_id, solution);
                 Command::none()
@@ -619,7 +593,7 @@ impl Application for GUIState {
                     Command::perform(
                         async move {
                             if let Some(node) = node {
-                                let  node_lock = node.lock().await;
+                                let node_lock = node.lock().await;
                                 let active_work = node_lock.get_active_work_by_id(work_id).await;
 
                                 match active_work {
@@ -632,12 +606,12 @@ impl Application for GUIState {
 
                                             node_lock
                                                 .network
-                                        
                                                 .send_completion_confirmation_ack(
                                                     &work.employer_peer_id,
                                                     work.work.id,
                                                     solution,
-                                                ).await;
+                                                )
+                                                .await;
                                         }
                                     }
                                     Err(_) => {
@@ -652,9 +626,7 @@ impl Application for GUIState {
                     Command::none()
                 }
             }
-            Message::SolutionDecision => {
-                Command::none()
-            }
+            Message::SolutionDecision => Command::none(),
             Message::UpdateSyncStatus => {
                 let _ = self.update_sync_ui();
                 Command::none()
@@ -668,17 +640,17 @@ impl Application for GUIState {
     }
     fn view(&self) -> Element<Message> {
         let content = self.main_view();
-    
+
         // Create the sync status bar
         let sync_status = Container::new(
             Row::new()
                 .push(Text::new(&self.sync_progress_message).size(12))
-                .width(Length::Fill)
+                .width(Length::Fill),
         )
         .width(Length::Fill)
         .padding(10)
         .style(theme::Container::Custom(Box::new(SyncStatusStyle)));
-    
+
         Column::new()
             .push(sync_status)
             .push(content)
@@ -695,17 +667,17 @@ impl Application for GUIState {
 impl CreateComponent for GUIState {
     fn create_button<'a>(&self, label: &'a str, message: Message) -> Button<'a, Message> {
         Button::new(
-            Container::new(Text::new(label).size(12)) 
+            Container::new(Text::new(label).size(12))
                 .width(Length::Fill)
-                .height(Length::Fixed(16.0)) 
+                .height(Length::Fixed(16.0))
                 .center_y()
                 .center_x(),
         )
         .width(Length::Shrink)
-        .padding([2, 8]) 
+        .padding([2, 8])
         .style(theme::Button::Custom(Box::new(ModernButtonStyle)))
         .on_press(message)
-     }
+    }
 
     fn create_centered_container<'a>(&self, content: Element<'a, Message>) -> Element<'a, Message> {
         Container::new(content)
@@ -716,8 +688,8 @@ impl CreateComponent for GUIState {
             .center_y()
             .into()
     }
-    
-    /// Creates a task item 
+
+    /// Creates a task item
     fn create_task_item<'a>(
         &self,
         title: &'a str,
@@ -726,50 +698,45 @@ impl CreateComponent for GUIState {
         time: &'a str,
     ) -> Container<'a, Message> {
         Container::new(
-            Row::new()
-                .spacing(8)
-                .push(
-                    Column::new()
-                        .width(Length::Fill)
-                        .spacing(4)
-                        .push(
-                            Row::new()
-                                .spacing(8)
-                                .align_items(iced::Alignment::Start)
-                                .push(
-                                    Text::new(title)
-                                        .size(13)
-                                        .width(Length::Fill)
-                                
-                                )
-                                .push(
-                                    Container::new(Text::new(payment).size(12))
-                                        .style(theme::Container::Custom(Box::new(PaymentBadgeStyle)))
-                                        .padding([2, 6])
-                                )
-                        )
-                        .push(
-                            Row::new()
-                                .spacing(8)
-                                .push(
-                                    Text::new(requirements)
-                                        .size(11)
-                                        .style(theme::Text::Color(iced::Color::from_rgb(0.6, 0.6, 0.7)))
-                                )
-                                .push(
-                                    Text::new("•")
-                                        .size(11)
-                                        .style(theme::Text::Color(iced::Color::from_rgb(0.4, 0.4, 0.5)))
-                                )
-                                .push(
-                                    Text::new(time)
-                                        .size(11)
-                                        .style(theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.6)))
-                                )
-                        )
-                )
+            Row::new().spacing(8).push(
+                Column::new()
+                    .width(Length::Fill)
+                    .spacing(4)
+                    .push(
+                        Row::new()
+                            .spacing(8)
+                            .align_items(iced::Alignment::Start)
+                            .push(Text::new(title).size(13).width(Length::Fill))
+                            .push(
+                                Container::new(Text::new(payment).size(12))
+                                    .style(theme::Container::Custom(Box::new(PaymentBadgeStyle)))
+                                    .padding([2, 6]),
+                            ),
+                    )
+                    .push(
+                        Row::new()
+                            .spacing(8)
+                            .push(
+                                Text::new(requirements).size(11).style(theme::Text::Color(
+                                    iced::Color::from_rgb(0.6, 0.6, 0.7),
+                                )),
+                            )
+                            .push(
+                                Text::new("•").size(11).style(theme::Text::Color(
+                                    iced::Color::from_rgb(0.4, 0.4, 0.5),
+                                )),
+                            )
+                            .push(
+                                Text::new(time).size(11).style(theme::Text::Color(
+                                    iced::Color::from_rgb(0.5, 0.5, 0.6),
+                                )),
+                            ),
+                    ),
+            ),
         )
         .style(theme::Container::Custom(Box::new(TaskItemStyle)))
+        .height(Length::Fixed(130.0))
+        .width(Length::FillPortion(1))
         .padding([8, 12])
     }
 }
@@ -835,7 +802,8 @@ impl GUIState {
                     "Waiting for initial sync."
                 } else {
                     "Node is disconnected."
-                }.to_string();
+                }
+                .to_string();
             }
         }
         Command::none()
@@ -901,14 +869,17 @@ impl GUIState {
         let node = self.node.clone();
         // let logger = Arc::clone(&self.logger);
 
-        Command::perform(async move {
-            if let Some(node) = node {
-                let task = node.lock().await.list_task().await;
-                task
-            } else {
-                Vec::new()
-            }
-        }, Message::TaskDiscovered)
+        Command::perform(
+            async move {
+                if let Some(node) = node {
+                    let task = node.lock().await.list_task().await;
+                    task
+                } else {
+                    Vec::new()
+                }
+            },
+            Message::TaskDiscovered,
+        )
     }
 
     fn fetch_proposals(&self) -> Command<Message> {
@@ -957,12 +928,14 @@ impl GUIState {
     fn start_node(&mut self) {
         if let Some(node) = self.node.clone() {
             let (_, rx) = mpsc::channel::<(String, LogLevel)>(100);
-            self.toolbar_buttons_state.connect.set_title("Stop Working".to_string());
+            self.toolbar_buttons_state
+                .connect
+                .set_title("Stop Working".to_string());
 
-            tokio::spawn(async move {   
-                    let mut cs_node = node.lock().await;
-                    let _ = cs_node.initial_setup().await;
-                    cs_node.monitor().await;
+            tokio::spawn(async move {
+                let mut cs_node = node.lock().await;
+                let _ = cs_node.initial_setup().await;
+               // cs_node.monitor().await;
             });
 
             self.node_running = true;
@@ -1025,9 +998,9 @@ impl GUIState {
                 "is_dedicated": false
             }
         }"#;
-        
+
         let work_broadcast: WorkBroadcast = serde_json::from_str(work_broadcast_json).unwrap();
-        
+
         let mut itas = Vec::new();
         itas.push(work_broadcast);
 
@@ -1039,7 +1012,7 @@ impl GUIState {
         // Command::perform(
         //     async move {
         //         if let Some(node) = node {
-                    
+
         //             match node.lock().await.list_work_opportunities().await {
         //                 Ok(items) => {
         //                     let logger_guard = logger.lock().await;
@@ -1089,7 +1062,7 @@ async fn main() -> iced::Result {
 
     // Define settings for the window
     let mut settings = Settings::with_flags(Arc::clone(&logger_arc));
-    settings.window.size = (1366, 930); 
+    settings.window.size = (1366, 930);
     settings.window.resizable = true;
     settings.window.position = Position::Specific(0, 0);
 

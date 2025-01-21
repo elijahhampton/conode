@@ -17,7 +17,8 @@ impl ContainerStyleSheet for ContentContainerStyle {
 
     fn appearance(&self, _style: &Self::Style) -> container::Appearance {
         container::Appearance {
-            background: Some(Background::Color(Color::from_rgb(0.04, 0.05, 0.07))),
+            background: Some(Background::Color(Color::from_rgb(0.02, 0.02, 0.03))),
+
             text_color: Some(Color::from_rgb(0.9, 0.9, 0.95)),
             border_radius: 0.0.into(),
             ..Default::default()
@@ -33,7 +34,8 @@ impl ContainerStyleSheet for OuterContainerStyle {
 
     fn appearance(&self, _style: &Self::Style) -> container::Appearance {
         container::Appearance {
-            background: Some(Background::Color(Color::from_rgb(0.02, 0.03, 0.04))),
+            background: Some(Background::Color(Color::from_rgb(0.02, 0.02, 0.03))),
+
             text_color: Some(Color::from_rgb(0.9, 0.9, 0.95)),
             ..Default::default()
         }

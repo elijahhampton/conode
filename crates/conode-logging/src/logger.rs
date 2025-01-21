@@ -38,7 +38,6 @@ pub struct AsyncLogger {
 pub static LOGGER: Lazy<Arc<Mutex<Option<AsyncLogger>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
 impl AsyncLogger {
-    /// Creates a new instance of the AsyncLogger.
     pub async fn new(log_file_path: &str, flush_interval: Duration) -> Self {
         let (sender, mut receiver): (Sender<LogEntry>, _) = channel(1000);
         let sender_clone: Sender<LogEntry> = sender.clone();
@@ -46,7 +45,6 @@ impl AsyncLogger {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let logs_clone = Arc::clone(&logs);
 
-        // Create broadcast channel
         let (broadcast_tx, _) = broadcast::channel(1000);
         let broadcast_tx_clone = broadcast_tx.clone();
 
@@ -60,24 +58,20 @@ impl AsyncLogger {
 
         let file_clone = Arc::clone(&file);
 
-        // Spawn a thread checking for newly received logs and occasionally
-        // flushing the log buffer on an interval.
         tokio::spawn(async move {
             let mut buffer = Vec::new();
-            let mut interval = interval(flush_interval);
+           let mut interval = interval(flush_interval);
 
             loop {
                 tokio::select! {
                     Some(entry) = receiver.recv() => {
-                        // Store in memory for UI
                         let mut logs = logs_clone.lock().await;
                         logs.push(entry.clone());
                         if logs.len() > 1000 {
                             logs.remove(0);
                         }
-                        drop(logs); // Explicitly drop the lock
+                        drop(logs); 
 
-                        // Broadcast the entry
                         let _ = broadcast_tx.send(entry.clone());
 
                         buffer.push(entry);

@@ -1,24 +1,23 @@
 // src/ui/views/restore_seed.rs
-use iced::widget::{text_input, Column, Row, Text};
 use iced::widget::Space;
+use iced::widget::{text_input, Column, Row, Text};
 use iced::{Alignment, Color};
 use iced::{Element, Length};
 
-use crate::ui::func::gui::traits::create::CreateComponent;
 use crate::app::messages::Message;
+use crate::ui::func::gui::traits::create::CreateComponent;
 use crate::GUIState;
 
 pub trait RestoreSeedView {
     fn seed_words(&self) -> &Vec<String>;
     fn restore_seed_view(&self) -> Element<Message>;
-
 }
 
 impl RestoreSeedView for GUIState {
     fn seed_words(&self) -> &Vec<String> {
         &self.recover_seed_words
     }
-    
+
     fn restore_seed_view(&self) -> Element<Message> {
         let title = Text::new("Restore from Seed Phrase")
             .size(28)

@@ -46,7 +46,7 @@ pub trait Negotiator {
     /// * `request` - The negotiation request details
     /// * `channel` - Channel for sending the response back
     fn handle_negotiation_request(
-        &self,
+        &mut self,
         from: PeerId,
         request_id: InboundRequestId,
         request: NegotiationRequest,

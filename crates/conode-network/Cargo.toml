@@ -48,3 +48,4 @@ hex = "0.4.3"
 x25519-dalek = "2.0.1"
 rand = "0.8.5"
 thiserror = "2.0.1"
+tracing.workspace = true

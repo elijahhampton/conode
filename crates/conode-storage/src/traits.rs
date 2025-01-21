@@ -6,10 +6,23 @@ pub trait StorageKey {
 }
 
 pub trait Storage {
-    fn get_key(&self, key: &[u8], cf_name: Option<&str>) -> Result<Option<Vec<u8>>, WorkManagerError>;
-    fn put_key(&self, key: &[u8], value: &[u8], cf_name: Option<&str>) -> Result<(), WorkManagerError>;
+    fn get_key(
+        &self,
+        key: &[u8],
+        cf_name: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, WorkManagerError>;
+    fn put_key(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        cf_name: Option<&str>,
+    ) -> Result<(), WorkManagerError>;
     fn delete_key(&self, key: &[u8], cf_name: Option<&str>) -> Result<(), WorkManagerError>;
-    fn batch_write(&self, cf_name: Option<&str>, batch: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Result<(), WorkManagerError>;
+    fn batch_write(
+        &self,
+        cf_name: Option<&str>,
+        batch: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(), WorkManagerError>;
 }
 
 pub trait StorageDefault {

@@ -7,7 +7,7 @@ use crate::types::enums::ExpiryOption;
 #[derive(Default, Debug, Clone)]
 pub struct ExpiryDatePickerParams {
     pub date: Date,
-    pub show_picker: bool
+    pub show_picker: bool,
 }
 
 #[derive(Debug, Clone)]

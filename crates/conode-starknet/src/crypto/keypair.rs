@@ -6,7 +6,7 @@ use libp2p::identity::{self, ed25519};
 use libp2p::PeerId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use starknet::core::types::Felt;
-use starknet::core::utils::{get_contract_address};
+use starknet::core::utils::get_contract_address;
 use starknet::signers::SigningKey;
 use starknet_crypto::get_public_key;
 use std::collections::HashMap;

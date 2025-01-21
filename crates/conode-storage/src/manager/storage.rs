@@ -4,15 +4,14 @@ use conode_types::sync::SyncRange;
 use rocksdb::{
     BoundColumnFamily, ColumnFamilyDescriptor, Direction, Error, IteratorMode, Options, DB,
 };
-use std::future::Future;
 use starknet::core::types::Felt;
-use std::{collections::HashMap};
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use crate::error::{StoreError, WorkManagerError};
 use conode_logging::logger::log_info;
 use conode_types::work::{ActiveWork, PendingItem, Work, WorkBroadcast};
-
 
 /// Storage manager for handling persistent data storage using RocksDB.
 /// Manages work items, proposals, and blockchain sync state.
@@ -61,7 +60,8 @@ impl InMemoryDb {
         let data_dir = configuration.config.data_dir;
 
         // We only wrap the DB in Arc since it's specifically designed for shared access
-        let db = DB::open_cf_descriptors(&opts, data_dir, cf_descriptors).map_err(|e| WorkManagerError::Internal(e.to_string()))?;
+        let db = DB::open_cf_descriptors(&opts, data_dir, cf_descriptors)
+            .map_err(|e| WorkManagerError::Internal(e.to_string()))?;
 
         Ok(InMemoryDb { db })
     }
@@ -159,7 +159,10 @@ impl InMemoryDb {
         let mut tasks = Vec::new();
 
         if cf_handle.is_some() {
-            let task_bytes: Vec<_> = self.db.full_iterator_cf(&cf_handle.unwrap(), IteratorMode::End).collect();
+            let task_bytes: Vec<_> = self
+                .db
+                .full_iterator_cf(&cf_handle.unwrap(), IteratorMode::End)
+                .collect();
             for bytes in task_bytes {
                 let (key_bytes, val_bytes) = bytes?;
                 match bincode::deserialize(&val_bytes) {
@@ -169,7 +172,7 @@ impl InMemoryDb {
                     _ => {}
                 }
             }
-        } 
+        }
 
         Ok(tasks)
     }
@@ -340,7 +343,10 @@ impl InMemoryDb {
         }
     }
 
-    pub async fn remove_proposal(&self, negotiation_id: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn remove_proposal(
+        &self,
+        negotiation_id: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let key = format!("proposals:{}", negotiation_id);
         Ok(self.db.delete(key)?)
     }
@@ -460,7 +466,9 @@ impl InMemoryDb {
             .map_err(|e| WorkManagerError::Internal(e.to_string()))?;
 
         // Store the solution with work ID as key
-        self.db.put_cf(&cf_handle, work_id, solution).map_err(|e| WorkManagerError::DatabaseError(e.to_string()));
+        self.db
+            .put_cf(&cf_handle, work_id, solution)
+            .map_err(|e| WorkManagerError::DatabaseError(e.to_string()));
 
         Ok(())
     }

@@ -1,11 +1,11 @@
 use crate::app::messages::Message;
+use crate::ui::func::gui::traits::create::CreateComponent;
 use crate::ui::styles::component::ProposalItemStyle;
 use crate::GUIState;
 use conode_types::negotiation::Negotiation;
 use iced::widget::{Button, Column, Container, Row, Scrollable, Text};
 use iced::{theme, Alignment, Color, Element, Length};
 use libp2p::PeerId;
-use crate::ui::func::gui::traits::create::CreateComponent;
 
 pub trait ProposalView {
     fn proposals(&self) -> &Vec<Negotiation>;
@@ -13,7 +13,6 @@ pub trait ProposalView {
     fn create_proposal_item_view<'a>(&self, proposal: &'a Negotiation) -> Element<'a, Message>;
     fn get_proposal_action(&self, proposal: &Negotiation) -> Option<(String, Message)>;
     fn proposals_view(&self) -> Element<Message>;
-
 }
 
 impl ProposalView for GUIState {
@@ -24,8 +23,6 @@ impl ProposalView for GUIState {
     fn local_peer_id(&self) -> PeerId {
         self.local_peer_id.expect("Local peer ID should be set") // Using the existing field
     }
-
-
 
     fn get_proposal_action(&self, proposal: &Negotiation) -> Option<(String, Message)> {
         let is_employer = self.local_peer_id() == proposal.employer;
@@ -183,9 +180,7 @@ impl ProposalView for GUIState {
         }
 
         Container::new(content)
-            .style(theme::Container::Custom(Box::new(
-                ProposalItemStyle,
-            )))
+            .style(theme::Container::Custom(Box::new(ProposalItemStyle)))
             .padding(10)
             .width(Length::Fill)
             .into()
@@ -205,8 +200,6 @@ impl ProposalView for GUIState {
         let scrollable_content = Scrollable::new(proposals_list)
             .height(Length::Fill)
             .width(Length::Fill);
-
-  
 
         let content = Column::new()
             .push(Text::new("Active Proposals").size(24).style(Color::WHITE))

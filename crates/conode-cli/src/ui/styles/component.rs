@@ -1,4 +1,3 @@
-
 use iced::widget::container::StyleSheet as ContainerStyleSheet;
 use iced::{
     theme::{self, Theme},
@@ -111,7 +110,7 @@ impl container::StyleSheet for SyncStatusStyle {
 
     fn appearance(&self, _style: &Self::Style) -> container::Appearance {
         container::Appearance {
-            text_color: Some(Color::from_rgb(0.8, 0.8, 0.8)),  // Light grey text
+            text_color: Some(Color::from_rgb(0.8, 0.8, 0.8)), // Light grey text
             background: Some(Background::Color(Color::from_rgb(0.15, 0.15, 0.15))), // Dark grey background
             border_radius: 0.0,
             border_width: 1.0,

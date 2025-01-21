@@ -2,6 +2,7 @@
 
 use crate::app::messages::Message;
 use crate::types::enums::View;
+use crate::ui::func::gui::traits::create::CreateComponent;
 use crate::GUIState;
 use chrono::{Local, Utc};
 use conode_logging::logger::{LogEntry, LogLevel};
@@ -9,14 +10,12 @@ use futures::executor;
 use iced::widget::{Button, Column, Scrollable, Text};
 use iced::{Alignment, Color, Element, Length};
 use tokio::sync::Mutex;
-use crate::ui::func::gui::traits::create::CreateComponent;
 
 pub trait LogsView {
     fn logger(&self) -> &std::sync::Arc<Mutex<Option<conode_logging::logger::AsyncLogger>>>;
     fn logs_view(&self) -> Element<Message>
     where
         Self: Sized;
-   
 }
 
 impl LogsView for GUIState {
@@ -69,11 +68,9 @@ impl LogsView for GUIState {
             .height(Length::Fill)
             .width(Length::Fill);
 
-
         let content = Column::new()
             .push(title)
             .push(scrollable_logs)
-            
             .spacing(20)
             .align_items(Alignment::Center);
 

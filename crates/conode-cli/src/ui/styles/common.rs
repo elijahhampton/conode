@@ -18,7 +18,8 @@ impl ContainerStyleSheet for HeaderStyle {
 
     fn appearance(&self, _style: &Self::Style) -> container::Appearance {
         container::Appearance {
-            background: Some(Background::Color(Color::from_rgb(0.08, 0.09, 0.11))),
+            background: Some(Background::Color(Color::from_rgb(0.15, 0.15, 0.18))),
+
             text_color: Some(Color::from_rgb(0.9, 0.9, 0.95)),
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
@@ -36,7 +37,10 @@ impl ContainerStyleSheet for SidebarStyle {
 
     fn appearance(&self, _style: &Self::Style) -> container::Appearance {
         container::Appearance {
-            background: Some(Background::Color(Color::from_rgb(0.06, 0.07, 0.09))),
+            background: Some(Background::Color(Color::from_rgb(0.15, 0.15, 0.18))),
+
+
+
             border_radius: 2.0.into(),
             text_color: Some(Color::from_rgb(0.9, 0.9, 0.95)),
             ..Default::default()
@@ -52,7 +56,10 @@ impl ContainerStyleSheet for SectionStyle {
 
     fn appearance(&self, _style: &Self::Style) -> container::Appearance {
         container::Appearance {
-            background: Some(Background::Color(Color::from_rgb(0.09, 0.10, 0.12))),
+            background: Some(Background::Color(Color::from_rgb(0.15, 0.15, 0.18))),
+
+
+
             border_radius: 2.0.into(),
             border_width: 1.0,
             border_color: Color::from_rgb(0.12, 0.13, 0.15),
@@ -61,4 +68,3 @@ impl ContainerStyleSheet for SectionStyle {
         }
     }
 }
-

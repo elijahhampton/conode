@@ -1,5 +1,3 @@
-
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -38,7 +36,7 @@ pub enum SyncEvent {
         percentage: f64,
     },
     // The node is currently ahead of the block provider
-    SyncAhead
+    SyncAhead,
 }
 
 unsafe impl Send for SyncEvent {}

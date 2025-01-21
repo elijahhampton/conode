@@ -17,7 +17,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::{mpsc, MutexGuard};
 
-
 #[derive(Debug, Clone)]
 pub enum Message {
     // Messages related to proposals

@@ -1,12 +1,23 @@
+use libp2p::kad::Event as KadEvent;
 use libp2p::{
-    core::{transport::{ListenerId, PortUse}, ConnectedPoint, Endpoint}, identify::Info, identity::PublicKey, mdns::Event as MdnsEvent, swarm::{ConnectionError, ConnectionId}, Multiaddr, PeerId, StreamProtocol
+    core::{
+        transport::{ListenerId, PortUse},
+        ConnectedPoint, Endpoint,
+    },
+    identify::Info,
+    identity::PublicKey,
+    mdns::Event as MdnsEvent,
+    swarm::{ConnectionError, ConnectionId},
+    Multiaddr, PeerId, StreamProtocol,
 };
+use libp2p_kad::KBucketDistance;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::{sync::{Mutex, RwLock}, time::Instant};
-use libp2p_kad::KBucketDistance;
-use libp2p::kad::Event as KadEvent;
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::Instant,
+};
 
 #[derive(Debug, Clone)]
 pub enum PeerState {
@@ -114,7 +125,6 @@ impl PeerManager {
         }
     }
 
-    
     pub async fn new_peer_connection(&self, peer_id: PeerId, connection: PeerConnection) {
         self.connections.write().await.insert(peer_id, connection);
         self.connections
@@ -194,7 +204,8 @@ impl PeerManager {
 
                 if let Some(old_peer) = old_peer {
                     if let Some(conn) = connections.get_mut(&old_peer) {
-                        conn.state = PeerState::Disconnected(Some("Replaced by new peer".to_string()));
+                        conn.state =
+                            PeerState::Disconnected(Some("Replaced by new peer".to_string()));
                     }
                 }
             }
@@ -375,19 +386,19 @@ impl PeerManager {
         for (_, addresses) in statuses.iter_mut() {
             for (_, status) in addresses.iter_mut() {
                 if matches!(status, ListenerStatus::Active) {
-                  //  *status = ListenerStatus::Closed(ListenerCloseReason::UserInitiated);
+                    //  *status = ListenerStatus::Closed(ListenerCloseReason::UserInitiated);
                 }
             }
         }
         statuses.clear();
-        
+
         let mut connections = self.connections.write().await;
         for (_, conn) in connections.iter_mut() {
             conn.state = PeerState::Disconnected(Some("Network shutdown".to_string()));
             conn.is_open = false;
         }
         connections.clear();
-        
+
         self.identifications.write().await.clear();
     }
 }

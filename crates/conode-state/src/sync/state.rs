@@ -5,30 +5,19 @@ use conode_storage::{
     error::SyncError,
     manager::{chain::ChainContext, storage::InMemoryDb},
 };
-use conode_types::{
-    chain::ChainConfig,
-    sync::SyncEvent,
-};
+use conode_types::{chain::ChainConfig, sync::SyncEvent};
 use starknet::{
-    core::{
-        types::{BlockId, EmittedEvent, EventFilter, Felt},
-    },
+    core::types::{BlockId, EmittedEvent, EventFilter, Felt},
     providers::Provider,
 };
+use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicBool, Arc};
-use std::{
-    sync::atomic::Ordering,
-};
 use tokio::{
-    sync::{
-        watch::Sender,
-        Mutex, RwLock,
-    },
+    sync::{watch::Sender, Mutex, RwLock},
     time::{sleep, Duration},
 };
 use tracing::{debug, info};
 use uuid::Uuid;
-
 
 /// SyncManager is responsible for syncing data retrieved from chain events
 /// into the in-memory database. It handles blockchain synchronization and event processing.
@@ -65,9 +54,8 @@ impl SyncState {
         storage_manager: Arc<Mutex<InMemoryDb>>,
         chain_operator: Arc<RwLock<ChainContext>>,
         config: ChainConfig,
-        event_sender: Sender<SyncEvent>
+        event_sender: Sender<SyncEvent>,
     ) -> Self {
-       
         Self {
             is_syncing: AtomicBool::new(false),
             chain_operator,
@@ -75,7 +63,6 @@ impl SyncState {
             chunk_size: 1,
             config,
             event_sender,
-        
         }
     }
 
@@ -94,35 +81,7 @@ impl SyncState {
             return Ok(());
         }
 
-        let mut backoff = ExponentialBackoff {
-            initial_interval: Self::INITIAL_RETRY_DELAY,
-            max_interval: Self::MAX_RETRY_DELAY,
-            max_elapsed_time: Some(Duration::from_secs(120)),
-            ..Default::default()
-        };
-
-        let _ = loop {
-            match self.attempt_sync().await {
-                Ok(_) => break Ok(()),
-                Err(e) => {
-                    if let Some(retry_delay) = backoff.next_backoff() {
-                        info!("{:?}", e);
-                        log_warning(format!(
-                            "Sync failed with error: {}. Retrying in {:?}...",
-                            e, retry_delay
-                        ))
-                        .await;
-
-                        self.event_sender.send(SyncEvent::SyncFailed);
-                        sleep(retry_delay).await;
-                        continue;
-                    } else {
-                        break Err(e);
-                    }
-                }
-            }
-        };
-
+        let _ = self.attempt_sync().await;
         self.is_syncing.store(false, Ordering::SeqCst);
 
         Ok(())
@@ -133,7 +92,6 @@ impl SyncState {
     /// # Returns
     /// * Result indicating success or error
     async fn attempt_sync(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        
         let latest_block_num = self
             .chain_operator
             .read()
@@ -142,7 +100,7 @@ impl SyncState {
             .provider()
             .block_number()
             .await?;
-       
+
         let latest_synced_block_num = self.storage_manager.lock().await.latest_synced_block();
         if latest_synced_block_num >= latest_block_num {
             return Ok(());
@@ -152,7 +110,6 @@ impl SyncState {
         let blocks_to_sync = latest_block_num - latest_synced_block_num;
         let chunks = (blocks_to_sync as f64 / self.chunk_size as f64).ceil() as u64;
 
-      
         self.event_sender
             .send(SyncEvent::SyncStarted {
                 from: latest_block_num,
@@ -174,7 +131,6 @@ impl SyncState {
             self.process_block_range(current, target)
                 .await
                 .map_err(|e| SyncError::Internal)?;
-        
         }
 
         self.event_sender.send(SyncEvent::SyncCompleted)?;
@@ -184,7 +140,6 @@ impl SyncState {
             .lock()
             .await
             .update_latest_synced_block_num(latest_block_num)?)
-            
     }
 
     /// Processes a range of blocks, extracting and handling relevant events.

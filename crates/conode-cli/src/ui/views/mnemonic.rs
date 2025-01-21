@@ -1,12 +1,12 @@
 // src/ui/views/mnemonic.rs
 
 use crate::app::messages::Message;
+use crate::ui::func::gui::traits::create::CreateComponent;
 use crate::GUIState;
 use iced::alignment::Alignment;
 use iced::theme;
 use iced::widget::{Button, Column, Container, Row, Text};
 use iced::{Color, Element, Length};
-use crate::ui::func::gui::traits::create::CreateComponent;
 
 pub trait MnemonicView {
     fn mnemonic_words(&self) -> &Vec<String>;
@@ -17,7 +17,6 @@ pub trait MnemonicView {
 }
 
 impl MnemonicView for GUIState {
-
     fn mnemonic_words(&self) -> &Vec<String> {
         &self.mnemonic_words
     }

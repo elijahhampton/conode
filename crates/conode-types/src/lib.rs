@@ -1,11 +1,10 @@
 pub mod chain;
 pub mod crypto;
 pub mod negotiation;
+pub mod network;
 pub mod peer;
 pub mod rsa;
 pub mod solution;
 pub mod sync;
 pub mod traits;
 pub mod work;
-
-

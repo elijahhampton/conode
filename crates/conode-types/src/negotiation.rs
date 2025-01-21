@@ -1,5 +1,8 @@
 use crate::{
-    crypto::{ECDSASignature, FeltWrapper}, peer::PeerInfo, traits::common::Unqiue, work::FlattenedWork
+    crypto::{ECDSASignature, FeltWrapper},
+    peer::PeerInfo,
+    traits::common::Unqiue,
+    work::FlattenedWork,
 };
 
 use libp2p::PeerId;

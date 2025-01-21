@@ -9,9 +9,9 @@ use conode_network::request::{RequestHandler, RetryConfig};
 use conode_starknet::crypto::keypair::KeyPair;
 use conode_state::state::service::StateService;
 use conode_state::sync::state::SyncState;
-use conode_storage::disk_db::{DiskDb};
+use conode_storage::disk_db::DiskDb;
 use conode_storage::manager::chain::ChainContext;
-use conode_storage::manager::storage::{InMemoryDb};
+use conode_storage::manager::storage::InMemoryDb;
 use conode_storage::traits::{Storage, StorageDefault};
 use conode_types::chain::ChainConfig;
 use conode_types::negotiation::Negotiation;
@@ -45,7 +45,7 @@ pub struct Node {
     pub state_service: Arc<StateService>,
     // An InMemoryDb
     mem_db: Arc<tokio::sync::Mutex<InMemoryDb>>,
-    pub sync_event_receiver: tokio::sync::watch::Receiver<SyncEvent>
+    pub sync_event_receiver: tokio::sync::watch::Receiver<SyncEvent>,
 }
 
 impl fmt::Debug for Node {
@@ -98,13 +98,12 @@ impl Node {
     pub async fn list_task(&self) -> Vec<WorkBroadcast> {
         match self.mem_db.lock().await.broadcasted_work() {
             Ok(task) => task,
-            Err(_) => Vec::new()
+            Err(_) => Vec::new(),
         }
     }
 
     /// Notify the state service to start the syncing process.
     pub async fn sync_chain(&self) -> anyhow::Result<()> {
-        // Start sync through state service
         self.state_service.start_sync().await;
         Ok(())
     }
@@ -112,13 +111,10 @@ impl Node {
     /// Creates a task on chain
     /// # Arguments
     /// task The task data to record on chain
-    /// 
+    ///
     /// # Returns
     /// transaction_hash Felt transaction hash if the transaction returned successful
-    pub async fn create_task(
-        &self,
-        task: &FlattenedWork,
-    ) -> Result<Felt, Box<dyn Error>> {
+    pub async fn create_task(&self, task: &FlattenedWork) -> Result<Felt, Box<dyn Error>> {
         let invoke_result = self
             .state_service
             .context
@@ -129,7 +125,7 @@ impl Node {
 
         Ok(invoke_result.transaction_hash)
     }
-    
+
     /// Returns all solutions for a group of active task.
     pub async fn active_work_with_solutions(
         &self,
@@ -158,11 +154,10 @@ impl Node {
 
     /// Returns a list of [`WorkBroadcast`] from the in memory
     /// data.
-    /// 
+    ///
     /// # Returns
     /// task A vector of [`WorkBroadcast`].
     pub async fn list_work_opportunities(&self) -> Result<Vec<WorkBroadcast>> {
-        
         let work_broadcast_json = r#"
 {
     "work": {
@@ -187,11 +182,11 @@ impl Node {
     }
 }"#;
 
-let work_broadcast: WorkBroadcast = serde_json::from_str(work_broadcast_json)?;
-let mut a = Vec::new();
-a.push(work_broadcast);
+        let work_broadcast: WorkBroadcast = serde_json::from_str(work_broadcast_json)?;
+        let mut a = Vec::new();
+        a.push(work_broadcast);
 
-Ok(a)
+        Ok(a)
 
         // match self.mem_db.lock().await.get_work() {
         //     Ok(work_opportunities) => Ok(work_opportunities),
@@ -208,30 +203,25 @@ Ok(a)
         let mut sync_interval = tokio::time::interval(Duration::from_secs(12));
         let mut consecutive_failures = 0;
         let mut shutdown = Box::pin(tokio::signal::ctrl_c());
-        
-        info!("Starting monitor loop");
+
         loop {
             tokio::select! {
                 _ = sync_interval.tick() => {
-                    debug!("Starting sync interval");
                     match self.sync_chain().await {
                         Ok(_) => {
                             if consecutive_failures > 0 {
                                 consecutive_failures = 0;
                                 sync_interval = tokio::time::interval(Duration::from_secs(12));
-                                info!("Reset sync interval after recovery");
                             }
                         }
                         Err(e) => {
                             consecutive_failures += 1;
                             let backoff_secs = std::cmp::min(12 * 2_u64.pow(consecutive_failures), 300);
                             sync_interval = tokio::time::interval(Duration::from_secs(backoff_secs));
-                            error!("Sync failed with backoff {}: {}", backoff_secs, e);
                         }
                     }
                 }
                 _ = &mut shutdown => {
-                    info!("Received shutdown signal, stopping monitor");
                     break;
                 }
             }
@@ -248,7 +238,6 @@ Ok(a)
 
         // Setup network listening on all network interfaces
         let addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
-   
 
         let state_service = self.state_service.clone();
         // Spawn the initial syncing processing in a worker thread
@@ -258,31 +247,17 @@ Ok(a)
         });
 
         let network = &self.network;
-        let  _  = network.start_listening(addr.clone()).await;
+        let _ = network.start_listening(addr.clone()).await;
         info!("Listening on all network interfaces");
 
         for node in BOOTSTRAP_NODES.iter() {
-         
             let update = network
                 .add_peer_to_kademlia_dht(&node.peer_id, node.addr.parse().unwrap())
-                .await?;
-
-
-            match update {
-                RoutingUpdate::Success => {
-                    debug!("Bootstraping node with address {} and current state {}", node.peer_id, "success".to_string());
-                }
-                RoutingUpdate::Failed => {
-                    debug!("Bootstraping node with address {} and current state {}", node.peer_id, "failed".to_string());
-                }
-                RoutingUpdate::Pending => {
-                    debug!("Bootstraping node with address {} and current state {}", node.peer_id, "pending".to_string());
-                }
-            }
+                .await;
         }
 
         network.bootstrap_kademlia().await;
-        let _joined = network.join_gossip_protocol().await?;
+        let _joined = network.join_gossip_protocol().await;
 
         info!("Initial setup complete");
 
@@ -291,12 +266,12 @@ Ok(a)
 
     /// Returns the PeerInformation for this node.
     pub async fn peer_info(&self) -> PeerInfo {
-        self.network.peer_info().await.unwrap()
+        self.network.peer_info().await.clone()
     }
 
     /// Returns the local peer id for this node.
     pub async fn local_peer_id(&self) -> PeerId {
-        self.network.local_peer_id().await
+        *self.network.local_peer_id().await
     }
 
     pub async fn list_active_work(&self) -> Result<Vec<ActiveWork>> {
@@ -311,7 +286,7 @@ Ok(a)
     pub async fn get_active_work_by_id(&self, work_id: String) -> Result<Option<ActiveWork>> {
         self.mem_db.lock().await.get_active_work_by_id(work_id)
     }
-    
+
     pub async fn list_proposals(&self) -> Result<Vec<Negotiation>> {
         match self.mem_db.lock().await.get_all_proposals().await {
             Ok(work_opportunities) => Ok(work_opportunities),
@@ -334,35 +309,28 @@ Ok(a)
         let conode_contract_address = configuration_exporter.config.contract.conode.clone();
         let payment_token_contract_address =
             configuration_exporter.config.contract.payment_token.clone();
-        let conode_deployment_block_num = configuration_exporter.config.contract.conode_deployment_block;
+        let conode_deployment_block_num = configuration_exporter
+            .config
+            .contract
+            .conode_deployment_block;
 
         info!("RPC configuration set to {}", rpc);
         info!("Connecting to Starknet chain: {}", chain_id);
-        info!("Using CoNode protocol deployed at {} on block {}", conode_contract_address, conode_deployment_block_num);
-        info!("Using payment token deployed at: {}", payment_token_contract_address);
-        
+        info!(
+            "Using CoNode protocol deployed at {} on block {}",
+            conode_contract_address, conode_deployment_block_num
+        );
+        info!(
+            "Using payment token deployed at: {}",
+            payment_token_contract_address
+        );
+
         let signing_key = SigningKey::from_secret_scalar(Felt::from_bytes_be_slice(
             local_key.keypair().secret().as_ref(),
         ));
         let wallet = LocalWallet::from_signing_key(signing_key);
 
-        // DistributedBehaviour (Swarm behavior)
-        let behaviour =
-            DistributedBehaviour::new(local_peer_id, local_key.keypair().clone().into());
-        // Swarm
-        let swarm = SwarmBuilder::with_existing_identity(local_key.keypair().clone().into())
-            .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default(),
-                libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
-            )
-            .context("Failed to create TCP transport")?
-            .with_behaviour(|_| Ok(behaviour))
-            .context("Failed to add behaviour to swarm")?
-            .build();
-
-        let local_peer_id = swarm.local_peer_id().clone();
+        let local_peer_id = PeerId::random(); //swarm.local_peer_id().clone();
         info!("Node created with PeerID {}", local_peer_id);
         let chain_config = ChainConfig {
             rpc,
@@ -380,21 +348,23 @@ Ok(a)
 
         let (sync_event_sender, sync_event_receiver) =
             tokio::sync::watch::channel(SyncEvent::SyncCompleted);
-        let sync_state = SyncState::new(Arc::clone(&mem_db), chain_context.clone(), chain_config, sync_event_sender.clone());
+        let sync_state = SyncState::new(
+            Arc::clone(&mem_db),
+            chain_context.clone(),
+            chain_config,
+            sync_event_sender.clone(),
+        );
 
-        let arc_swarm = Arc::new(Mutex::new(swarm));
-
-        let (handle, mut network_rx) = Network::new(
-            arc_swarm.clone(),
+        let handle = Network::new(
+            local_peer_id,
             local_key.clone(),
             chain_context.clone(),
             Arc::clone(&mem_db),
             configuration_exporter.clone(),
-            RequestHandler::new(arc_swarm.clone(), mem_db.clone(),Box::new(DiskDb::default()), RetryConfig::default()),
-            Box::new(DiskDb::default())
-        ).await?;
+        )
+        .await?;
 
-        let local_peer_info = handle.peer_info().await.unwrap().clone();
+        let local_peer_info = handle.peer_info().await.clone();
         info!("Node created with peer info: {:?}", local_peer_info);
 
         let node = Node {
@@ -406,7 +376,7 @@ Ok(a)
                 context: chain_context,
             }),
             mem_db,
-            sync_event_receiver
+            sync_event_receiver,
         };
 
         Ok((node, local_peer_id, local_peer_info))

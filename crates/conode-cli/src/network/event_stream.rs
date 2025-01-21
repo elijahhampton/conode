@@ -1,10 +1,10 @@
+use crate::Message;
 use conode_types::sync::SyncEvent;
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
 use tokio_stream::Stream;
-use crate::Message;
 
 /// An [`EventStream`] for polling/receiving [`SyncEvent`].
 pub struct EventStream {

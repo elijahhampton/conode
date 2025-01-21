@@ -12,10 +12,8 @@ use starknet::{
     },
     providers::Provider,
 };
+use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicBool, Arc};
-use std::{
-    sync::atomic::Ordering,
-};
 use tokio::{
     sync::Mutex,
     time::{sleep, Duration},
@@ -82,52 +80,16 @@ impl SyncState {
     /// # Returns
     /// * Result indicating success or error
     pub async fn sync_to_latest_block(&mut self) -> Result<(), SyncError> {
-        println!("sync_to_latest_block");
-        // if !self
-        //     .is_syncing
-        //     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        //     .is_ok()
-        // {
-        //     info!("sync_toffffffffff_latest_block");
-        //     return Ok(());
-        // }
+        if !self
+            .is_syncing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Ok(());
+        }
 
-        let mut backoff = ExponentialBackoff {
-            initial_interval: Self::INITIAL_RETRY_DELAY,
-            max_interval: Self::MAX_RETRY_DELAY,
-            max_elapsed_time: Some(Duration::from_secs(120)),
-            ..Default::default()
-        };
-
-        let _ = loop {
-            match self.attempt_sync().await {
-                Ok(_) => break Ok(()),
-                Err(e) => {
-                    if let Some(retry_delay) = backoff.next_backoff() {
-                        info!("{:?}", e);
-                        log_warning(format!(
-                            "Sync failed with error: {}. Retrying in {:?}...",
-                            e, retry_delay
-                        ))
-                        .await;
-                        sleep(retry_delay).await;
-                        continue;
-                    } else {
-                        break Err(e);
-                    }
-                }
-            }
-        };
-
+        self.attempt_sync().await;
         self.is_syncing.store(false, Ordering::SeqCst);
-
-        // TODO: add_mpsc_channel_progress_network_events
-        // if let Err(e) = &result {
-        //     self.event_sender.send(NetworkEvent::SyncFailed(e.to_string())).await?;
-        // } else {
-        //     self.event_sender.send(NetworkEvent::SyncCompleted).await?;
-        // }
-
         Ok(())
     }
 
@@ -136,20 +98,18 @@ impl SyncState {
     /// # Returns
     /// * Result indicating success or error
     async fn attempt_sync(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        
         let chain_tip = {
-            self
-            .chain_operator
-            .lock()
-            .await
-            .starknet_provider()
-            .provider()
-            .block_number()
-            .await?
+            self.chain_operator
+                .lock()
+                .await
+                .starknet_provider()
+                .provider()
+                .block_number()
+                .await?
         };
-        
+
         let latest_synced_block_num = self.storage_manager.lock().await.latest_synced_block();
-   
+
         if chain_tip <= latest_synced_block_num {
             return Ok(());
         }
@@ -179,11 +139,9 @@ impl SyncState {
             self.process_block_range(current, target)
                 .await
                 .map_err(|_| SyncError::Internal)?;
-      
         }
 
-        self
-            .storage_manager
+        self.storage_manager
             .lock()
             .await
             .update_latest_synced_block_num(chain_tip)?;
@@ -251,8 +209,6 @@ impl SyncState {
     }
 
     async fn process_event_batch(&self, events: &Vec<EmittedEvent>) -> Result<(), SyncError> {
-     
-
         for event in events {
             self.process_event(&event).await?
         }

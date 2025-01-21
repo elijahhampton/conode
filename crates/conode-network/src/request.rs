@@ -1,18 +1,21 @@
-use conode_storage::disk_db::DiskDb;
-use conode_storage::manager::storage::{InMemoryDb};
-use conode_storage::traits::Storage;
-use conode_types::negotiation::{Negotiation, NegotiationRequest};
-use libp2p::request_response::{Event, InboundRequestId, OutboundRequestId};
-use tokio::time::{sleep, Duration};
-use tokio::sync::{oneshot, Mutex};
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use std::time::SystemTime;
-use libp2p::{PeerId, Swarm};
-use std::sync::Arc;
 use crate::behaviour::DistributedBehaviour;
+use crate::handle::NetworkStorage;
 use crate::network::NetworkError;
+use conode_storage::disk_db::DiskDb;
+use conode_storage::manager::storage::InMemoryDb;
+use conode_storage::traits::Storage;
+use conode_storage::traits::StorageDefault;
 use conode_types::negotiation::ProposalStatus;
+use conode_types::negotiation::{Negotiation, NegotiationRequest};
+use conode_types::sync::SyncEvent;
+use libp2p::request_response::{Event, InboundRequestId, OutboundRequestId};
+use libp2p::{PeerId, Swarm};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::SystemTime;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::{sleep, Duration};
 
 use std::io;
 // The main event enum for the request/response protocol
@@ -33,7 +36,7 @@ pub enum RequestResponseEvent {
     // Sent when we've successfully sent a response
     ResponseSent {
         peer: PeerId,
-        request_id: InboundRequestId
+        request_id: InboundRequestId,
     },
     // Sent when we receive a response to our request
     Response {
@@ -86,13 +89,17 @@ impl From<io::Error> for RequestResponseError {
     }
 }
 
-
 // Represents the state of an outbound request
 #[derive(Serialize, Deserialize, Clone, Debug)]
 enum RequestState {
     Pending,
-    InProgress { attempts: u32, last_attempt: SystemTime },
-    Failed { reason: String },
+    InProgress {
+        attempts: u32,
+        last_attempt: SystemTime,
+    },
+    Failed {
+        reason: String,
+    },
     Completed,
 }
 
@@ -136,47 +143,63 @@ impl Default for RetryConfig {
     }
 }
 
-pub struct RequestHandler<S: Storage + Send + Sync> {
+pub struct RequestHandler {
     swarm: Arc<Mutex<Swarm<DistributedBehaviour>>>,
+    local_peer_id: PeerId,
     mem_db: Arc<Mutex<InMemoryDb>>,
-    persistent_db: S,
+    persistent_db: DiskDb,
     retry_config: RetryConfig,
-    request_handlers: Arc<Mutex<HashMap<String, oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>>>>
+    request_handlers: Arc<
+        Mutex<
+            HashMap<String, oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+        >,
+    >,
 }
 
-impl<S: Storage + Send + Sync> RequestHandler<S> {
-    pub fn new(swarm: Arc<Mutex<Swarm<DistributedBehaviour>>>, 
-           mem_db: Arc<Mutex<InMemoryDb>>,
-           persistent_db: S,
-           retry_config: RetryConfig) -> Self {
+impl RequestHandler {
+    pub fn new(
+        swarm: Arc<Mutex<Swarm<DistributedBehaviour>>>,
+        local_peer_id: PeerId,
+        mem_db: Arc<Mutex<InMemoryDb>>,
+        retry_config: RetryConfig,
+    ) -> Self {
         Self {
             swarm,
+            local_peer_id,
             mem_db,
-            persistent_db,
+            persistent_db: DiskDb::default(),
             retry_config,
-            request_handlers: Arc::new(Mutex::new(HashMap::new()))
+            request_handlers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    fn store_pending_request(&self, request: &PendingRequest) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn store_pending_request(
+        &self,
+        request: &PendingRequest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let serialized = serde_json::to_string(request)?;
         let key = format!("pending_request:{}", request.request_id);
-        
-        self.persistent_db.put_key(&key.as_bytes(), serialized.as_bytes(), None);
+
+        self.persistent_db
+            .put_key(&key.as_bytes(), serialized.as_bytes(), None);
         Ok(())
     }
 
-    fn update_request_state(&self, request_id: &str, new_state: RequestState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn update_request_state(
+        &self,
+        request_id: &str,
+        new_state: RequestState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let key = format!("pending_request:{}", request_id);
         let existing_data = self.persistent_db.get_key(&key.as_bytes(), None)?.unwrap();
 
-            let mut request: PendingRequest = serde_json::from_slice(&existing_data)?;
-            request.state = new_state;
-            
-            let serialized = serde_json::to_string(&request)?;
-            self.persistent_db.put_key(&key.as_bytes(), serialized.as_bytes(), None)?;
-        
-        
+        let mut request: PendingRequest = serde_json::from_slice(&existing_data)?;
+        request.state = new_state;
+
+        let serialized = serde_json::to_string(&request)?;
+        self.persistent_db
+            .put_key(&key.as_bytes(), serialized.as_bytes(), None)?;
+
         Ok(())
     }
 
@@ -187,72 +210,87 @@ impl<S: Storage + Send + Sync> RequestHandler<S> {
 
         let mut batch_ops = Vec::new();
 
-        let data = self.persistent_db.get_key(b"all_requests", None).unwrap().unwrap();
-                // Collect keys to delete
+        let data = self
+            .persistent_db
+            .get_key(b"all_requests", None)
+            .unwrap()
+            .unwrap();
+        // Collect keys to delete
 
-            if let Ok(requests) = serde_json::from_slice::<Vec<PendingRequest>>(&data) {
-                for request in requests {
-                    match request.state {
-                        RequestState::Completed | RequestState::Failed { .. } 
-                            if request.created_at < cleanup_threshold => {
-                            let key = format!("pending_request:{}", request.request_id);
-                            batch_ops.push((key.into_bytes(), None)); // None means delete
-                        }
-                        _ => continue,
+        if let Ok(requests) = serde_json::from_slice::<Vec<PendingRequest>>(&data) {
+            for request in requests {
+                match request.state {
+                    RequestState::Completed | RequestState::Failed { .. }
+                        if request.created_at < cleanup_threshold =>
+                    {
+                        let key = format!("pending_request:{}", request.request_id);
+                        batch_ops.push((key.into_bytes(), None)); // None means delete
                     }
+                    _ => continue,
                 }
-            
+            }
         }
-       
+
         if let Err(e) = self.persistent_db.batch_write(None, batch_ops) {
             eprintln!("Failed to cleanup old requests: {}", e);
         }
     }
 
-    async fn handle_request_response_event(&mut self, event: RequestResponseEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle_request_response_event(
+        &mut self,
+        event: RequestResponseEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match event {
-            RequestResponseEvent::OutboundFailure { peer, request_id, error } => {
+            RequestResponseEvent::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => {
                 // Look up the original request in RocksDB using a composite key
                 let key = format!("outbound_request:{}:{:?}", peer, request_id);
                 let request_data = self.persistent_db.get_key(&key.as_bytes(), None)?.unwrap();
-            
-                    let pending_request: PendingRequest = serde_json::from_slice(&request_data)?;
-                    
-                    // Analyze the error type to determine if retry is appropriate
-                    match error {
-                        RequestResponseError::ConnectionClosed | 
-                        RequestResponseError::Timeout => {
-                            // These are retriable errors
-                            self.handle_retriable_failure(&pending_request).await?;
-                        },
-                        RequestResponseError::DialFailure |
-                        RequestResponseError::UnsupportedProtocols => {
-                            // These are permanent failures
-                            self.handle_permanent_failure(
-                                &pending_request,
-                                format!("Permanent failure: {:?}", error)
-                            ).await?;
-                        }
-                        RequestResponseError::IoError(error) => todo!(),
-                        RequestResponseError::Cancelled => todo!(),
-                        RequestResponseError::RemoteBusy => todo!(),
-                        RequestResponseError::Rejected => todo!(),
-                        RequestResponseError::MaxOutboundRequestsPerPeer => todo!(),
-                    }
-                
-             
-            },
 
-            RequestResponseEvent::InboundFailure { peer, request_id, error } => {
+                let pending_request: PendingRequest = serde_json::from_slice(&request_data)?;
+
+                // Analyze the error type to determine if retry is appropriate
+                match error {
+                    RequestResponseError::ConnectionClosed | RequestResponseError::Timeout => {
+                        // These are retriable errors
+                        self.handle_retriable_failure(&pending_request).await?;
+                    }
+                    RequestResponseError::DialFailure
+                    | RequestResponseError::UnsupportedProtocols => {
+                        // These are permanent failures
+                        self.handle_permanent_failure(
+                            &pending_request,
+                            format!("Permanent failure: {:?}", error),
+                        )
+                        .await?;
+                    }
+                    RequestResponseError::IoError(error) => todo!(),
+                    RequestResponseError::Cancelled => todo!(),
+                    RequestResponseError::RemoteBusy => todo!(),
+                    RequestResponseError::Rejected => todo!(),
+                    RequestResponseError::MaxOutboundRequestsPerPeer => todo!(),
+                }
+            }
+
+            RequestResponseEvent::InboundFailure {
+                peer,
+                request_id,
+                error,
+            } => {
                 // Log inbound failures for monitoring
                 log::warn!(
                     "Inbound failure from peer {}: {:?} (request_id: {:?})",
-                    peer, error, request_id
+                    peer,
+                    error,
+                    request_id
                 );
 
                 // Update peer reliability metrics
                 self.update_peer_metrics(&peer, false).await?;
-            },
+            }
 
             RequestResponseEvent::ResponseSent { peer, request_id } => {
                 // Track successful response for peer reliability
@@ -261,39 +299,44 @@ impl<S: Storage + Send + Sync> RequestHandler<S> {
                 // Clean up any pending request state
                 let key = format!("outbound_request:{}:{:?}", peer, request_id);
                 let request_data = self.persistent_db.get_key(&key.as_bytes(), None)?.unwrap();
-              
-                    let mut pending_request: PendingRequest = serde_json::from_slice(&request_data)?;
-                    pending_request.state = RequestState::Completed;
-                    
-                    // Update final state
-                    self.store_pending_request(&pending_request)?;
-                
-              
+
+                let mut pending_request: PendingRequest = serde_json::from_slice(&request_data)?;
+                pending_request.state = RequestState::Completed;
+
+                // Update final state
+                self.store_pending_request(&pending_request)?;
             }
             _ => {}
         }
         Ok(())
     }
 
-    async fn handle_retriable_failure(&mut self, request: &PendingRequest) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle_retriable_failure(
+        &mut self,
+        request: &PendingRequest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &request.state {
-            RequestState::InProgress { attempts, last_attempt } => {
+            RequestState::InProgress {
+                attempts,
+                last_attempt,
+            } => {
                 if *attempts < self.retry_config.max_attempts {
                     // Calculate next retry delay using exponential backoff
                     let delay = self.calculate_retry_delay(*attempts);
-                    
+
                     // Schedule retry
                     let request_clone = request.clone();
-                 //   let self_clone = Arc::new(self);
-                    
+                    //   let self_clone = Arc::new(self);
+
                     self.send_request_with_retry(&request_clone).await;
                 } else {
                     self.handle_permanent_failure(
                         request,
-                        "Max retry attempts exceeded".to_string()
-                    ).await?;
+                        "Max retry attempts exceeded".to_string(),
+                    )
+                    .await?;
                 }
-            },
+            }
             _ => {
                 // Request is not in progress - possibly already handled
                 log::warn!(
@@ -309,15 +352,22 @@ impl<S: Storage + Send + Sync> RequestHandler<S> {
     async fn handle_permanent_failure(
         &mut self,
         request: &PendingRequest,
-        reason: String
+        reason: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Update request state to failed
         let mut updated_request = request.clone();
-        updated_request.state = RequestState::Failed { reason: reason.clone() };
+        updated_request.state = RequestState::Failed {
+            reason: reason.clone(),
+        };
         self.store_pending_request(&updated_request);
 
         // Notify any waiting handlers
-        if let Some(sender) = self.request_handlers.lock().await.remove(&request.request_id) {
+        if let Some(sender) = self
+            .request_handlers
+            .lock()
+            .await
+            .remove(&request.request_id)
+        {
             let _ = sender.send(Err(reason.into()));
         }
 
@@ -327,9 +377,13 @@ impl<S: Storage + Send + Sync> RequestHandler<S> {
         Ok(())
     }
 
-    async fn update_peer_metrics(&mut self, peer: &PeerId, success: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn update_peer_metrics(
+        &mut self,
+        peer: &PeerId,
+        success: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let key = format!("peer_metrics:{}", peer);
-        let val_or_none =  self.persistent_db.get_key(&key.as_bytes(), None)?;
+        let val_or_none = self.persistent_db.get_key(&key.as_bytes(), None)?;
 
         let metrics = if val_or_none.is_some() {
             let mut metrics: PeerMetrics = serde_json::from_slice(&val_or_none.unwrap())?;
@@ -347,10 +401,10 @@ impl<S: Storage + Send + Sync> RequestHandler<S> {
             }
         };
 
-
         // Store updated metrics
         let serialized = serde_json::to_string(&metrics)?;
-        self.persistent_db.put_key(&key.as_bytes(), serialized.as_bytes(), None)?;
+        self.persistent_db
+            .put_key(&key.as_bytes(), serialized.as_bytes(), None)?;
 
         Ok(())
     }
@@ -358,14 +412,11 @@ impl<S: Storage + Send + Sync> RequestHandler<S> {
     fn calculate_retry_delay(&self, attempt: u32) -> Duration {
         let base_delay = self.retry_config.initial_delay;
         let backoff = (self.retry_config.backoff_factor as u32).pow(attempt);
-        std::cmp::min(
-            base_delay * backoff,
-            self.retry_config.max_delay
-        )
+        std::cmp::min(base_delay * backoff, self.retry_config.max_delay)
     }
-    
+
     async fn send_single_request(
-        &self,
+        &mut self,
         recipient: &PeerId,
         request: NegotiationRequest,
     ) -> Result<OutboundRequestId, Box<dyn std::error::Error + Send + Sync>> {
@@ -381,14 +432,17 @@ impl<S: Storage + Send + Sync> RequestHandler<S> {
         Ok(outbound_req_id)
     }
 
-    async fn send_request_with_retry(&mut self, pending_request: &PendingRequest) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn send_request_with_retry(
+        &mut self,
+        pending_request: &PendingRequest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut current_attempt = 0;
         let mut delay = self.retry_config.initial_delay;
 
         while current_attempt < self.retry_config.max_attempts {
             // Create the request
             let request = NegotiationRequest::NewProposal(
-                self.swarm.lock().await.local_peer_id().clone(),
+                self.local_peer_id.clone(),
                 pending_request.negotiation.clone(),
             );
 
@@ -398,20 +452,29 @@ impl<S: Storage + Send + Sync> RequestHandler<S> {
                 RequestState::InProgress {
                     attempts: current_attempt + 1,
                     last_attempt: SystemTime::now(),
-                })?;
+                },
+            )?;
 
             // Set up response channel for this attempt
             let (tx, rx) = oneshot::channel();
-            self.request_handlers.lock().await.insert(pending_request.request_id.clone(), tx);
+            self.request_handlers
+                .lock()
+                .await
+                .insert(pending_request.request_id.clone(), tx);
 
             // Send the request
-            match self.send_single_request(&pending_request.recipient, request).await {
+            match self
+                .send_single_request(&pending_request.recipient, request)
+                .await
+            {
                 Ok(_) => {
                     // Wait for response or timeout
                     match tokio::time::timeout(
                         Duration::from_secs(30), // Configurable timeout
-                        rx
-                    ).await {
+                        rx,
+                    )
+                    .await
+                    {
                         Ok(Ok(_)) => {
                             // Success - update state and return
                             self.update_request_state(
@@ -433,16 +496,16 @@ impl<S: Storage + Send + Sync> RequestHandler<S> {
                             );
                         }
                         Err(e) => {
-                               // Timeout or channel error - retry
-                               current_attempt += 1;
-                               if current_attempt == self.retry_config.max_attempts {
-                                   return Err(e.into());
-                               }
-                               sleep(delay).await;
-                               delay = std::cmp::min(
-                                   delay.mul_f32(self.retry_config.backoff_factor),
-                                   self.retry_config.max_delay,
-                               );
+                            // Timeout or channel error - retry
+                            current_attempt += 1;
+                            if current_attempt == self.retry_config.max_attempts {
+                                return Err(e.into());
+                            }
+                            sleep(delay).await;
+                            delay = std::cmp::min(
+                                delay.mul_f32(self.retry_config.backoff_factor),
+                                self.retry_config.max_delay,
+                            );
                         }
                     }
                 }

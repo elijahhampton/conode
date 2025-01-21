@@ -36,7 +36,7 @@ pub struct NodeConfig {
     pub rpc: RpcConfig,
     pub account: AccountConfig,
     pub contract: ContractConfig,
-    pub task: TaskCriteria
+    pub task: TaskCriteria,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -70,7 +70,10 @@ impl TryFrom<Config> for ConfigurationExporter {
         };
 
         let task = TaskCriteria {
-            min_reward: config.get_int("task_criteria.min_reward")?.try_into().unwrap_or(0)
+            min_reward: config
+                .get_int("task_criteria.min_reward")?
+                .try_into()
+                .unwrap_or(0),
         };
 
         Ok(ConfigurationExporter {
@@ -80,7 +83,7 @@ impl TryFrom<Config> for ConfigurationExporter {
                 rpc,
                 account,
                 contract,
-                task
+                task,
             },
         })
     }
@@ -104,7 +107,7 @@ impl Default for ConfigurationExporter {
                     conode: "".to_string(),
                     conode_deployment_block: 0,
                 },
-                task: TaskCriteria { min_reward: 0 }
+                task: TaskCriteria { min_reward: 0 },
             },
         }
     }

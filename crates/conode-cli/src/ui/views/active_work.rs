@@ -4,20 +4,18 @@ use iced::widget::{Button, TextInput};
 use iced::{theme, Element};
 
 use crate::app::messages::Message;
+use crate::ui::func::gui::traits::create::CreateComponent;
+use crate::ui::styles::button::ActionButtonStyle;
 use crate::ui::styles::component::ProposalItemStyle;
 use crate::GUIState;
 use conode_types::work::{ActiveWork, JobRole};
-use crate::ui::styles::button::ActionButtonStyle;
+use iced::widget::Scrollable;
 use iced::{
-    widget::{
-      Column, Container, Row, Space, Text,
-    },
+    widget::{Column, Container, Row, Space, Text},
     Alignment, Color, Length,
 };
-use iced::widget::Scrollable;
-use crate::ui::func::gui::traits::create::CreateComponent;
 
-pub trait ActiveWorkView  {
+pub trait ActiveWorkView {
     fn active_works(&self) -> &Vec<ActiveWork>;
 
     fn create_active_work_item_view<'a>(
@@ -40,7 +38,6 @@ impl ActiveWorkView for GUIState {
     fn active_works(&self) -> &Vec<ActiveWork> {
         &self.active_works
     }
-
 
     fn get_solution(
         &self,
@@ -200,7 +197,6 @@ impl ActiveWorkView for GUIState {
         let scrollable_content = Scrollable::new(active_works_list)
             .height(Length::Fill)
             .width(Length::Fill);
-
 
         let content = Column::new()
             .push(Text::new("Active Work").size(24).style(Color::WHITE))

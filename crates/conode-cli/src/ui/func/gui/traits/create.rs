@@ -1,6 +1,6 @@
+use crate::app::Message;
 use iced::widget::{container, Button, Column, Container, Row, Text};
 use iced::Element;
-use crate::app::Message;
 
 pub trait CreateComponent {
     /// Creates a task item.

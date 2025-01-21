@@ -1,12 +1,15 @@
 use std::borrow::Borrow;
-use std::future::Future;
-use std::str::FromStr;
-use std::{error::Error, sync::Arc};
 use std::collections::HashMap;
+use std::future::{Future, IntoFuture};
+use std::str::FromStr;
+use std::thread::JoinHandle;
+use std::time::Duration;
+use std::{error::Error, sync::Arc};
 
 use crate::behaviour::DistributedBehaviour;
-use crate::connection::{ NetworkConnectionHandler};
+use crate::connection::NetworkConnectionHandler;
 use crate::event::{CoNodeEvent, DistributedBehaviourEvent};
+use crate::peer::peer_connection::ListenerCloseReason;
 use crate::peer::peer_connection::{PeerConnection, PeerManager};
 use crate::protocol::{
     discovery::{
@@ -15,18 +18,20 @@ use crate::protocol::{
     },
     negotiation::traits::Negotiator,
 };
-use crate::request::RequestHandler;
-use crate::peer::peer_connection::ListenerCloseReason;
+use crate::request::{RequestHandler, RetryConfig};
 use chrono::DateTime;
 use conode_config::configuration_exporter::ConfigurationExporter;
 use conode_logging::logger::{log_info, log_warning};
 use conode_starknet::crypto::keypair::KeyPair;
+use conode_storage::disk_db::DiskDb;
 use conode_storage::manager::chain::ChainContext;
-use conode_storage::manager::storage::{InMemoryDb};
+use conode_storage::manager::storage::InMemoryDb;
+use conode_storage::traits::StorageDefault;
 use conode_types::crypto::{ECDSASignature, FeltWrapper};
 use conode_types::negotiation::ProposalStatus;
 use conode_types::peer::PeerInfo;
 
+use conode_types::sync::SyncEvent;
 use conode_types::traits::libp2p::GossipsubNodeProvider;
 use conode_types::work::{ActiveWork, JobRole};
 use conode_types::{
@@ -39,12 +44,12 @@ use libp2p::dcutr::outbound;
 use libp2p::gossipsub::SubscriptionError;
 use libp2p::request_response::Event as RequestResponseEvent;
 use libp2p::swarm::SwarmEvent;
-use libp2p::Multiaddr;
 use libp2p::{
     gossipsub::Message as GossipsubMessage,
     request_response::{InboundRequestId, OutboundRequestId, ResponseChannel},
     PeerId, Swarm,
 };
+use libp2p::{Multiaddr, SwarmBuilder};
 use log::{debug, error, info};
 use rand::{self, Rng};
 
@@ -56,30 +61,7 @@ use uuid::Uuid;
 
 use thiserror::Error;
 
-use crate::handle::{NetworkHandle, NetworkHandleMessage, NetworkStorage};
-
-/// A context for inbound/outbound request used to map the request id to
-/// a context.
-#[derive(Clone, Debug, Copy)]
-pub enum InboundOutboundContext {
-    InboundNegotiation,
-    OutboundNegotiation,
-    OutboundRequestCompletion,
-    OutboundCompletionConfirmation,
-    OutboundCompletionAcknowledgement
-}
-
-
-/// A status for inbound/outbound request/response states.
-#[derive(Debug)]
-pub enum InboundOutboundState {
-    // Represents a successful inbound or outbound request/response.
-    Success,
-    /// Represents an inbound or outbound request/response in an error state.
-    InboundError(InboundFailure),
-    /// Represents an inbound or outbound request/response in an error state.
-    OutboundError(OutboundFailure)
-}
+use crate::handle::{NetworkHandle, NetworkStorage};
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
@@ -90,7 +72,33 @@ pub enum NetworkError {
     #[error("Network request failed")]
     RequestFailed,
     #[error("Max retries succeeded")]
-    MaxRetriesExceeded
+    MaxRetriesExceeded,
+}
+
+#[derive(Clone, Debug)]
+pub enum NetworkEvent {
+    /// Bootstrap the DHT
+    BootstrapKademlia,
+    /// Starts the network listening on a [`Multiaddr`].
+    Listen(Multiaddr),
+    /// Publish a GossipsubMessage to the network
+    Publish(WorkBroadcast),
+    /// Send a completion confirmation acknowledgement to a peer
+    SendCompletionConfirmationAck(PeerId, String, String),
+    /// Join the gossip channel
+    Join,
+    /// Initiate a negotiation
+    InitiateNegotiation(PeerId, String, Negotiation),
+    /// Request a completion acknowledgement
+    RequestCompletionAcknowledgement(PeerId, Negotiation),
+    /// Send completion confirmation request
+    SendCompletionConfirmationRequest(PeerId, String),
+    /// Shutdown netowrk
+    Shutdown,
+    /// Adds a peer to the Kademlia DHT
+    AddPeerToKademlia(PeerId, Multiaddr),
+    // Perform no action
+    Noop,
 }
 
 /// Provides the core network implementation of the protocol. All functionality related to
@@ -104,69 +112,178 @@ pub struct Network {
     /// An in memory db
     pub mem_db: Arc<tokio::sync::Mutex<InMemoryDb>>,
     // A peer manager
-    peer_manager: PeerManager,
+    peer_manager: Arc<Mutex<PeerManager>>,
     // An application Keypair
     keypair: KeyPair,
-    // Context for an outbound request id
-    pub outbound_context: HashMap<OutboundRequestId, InboundOutboundContext>,
-    pub outbound_proposals: Arc<tokio::sync::Mutex<HashMap<OutboundRequestId, Negotiation>>>,
     pub config: ConfigurationExporter,
-    request_handler: RequestHandler<Box<dyn NetworkStorage>>,
-    disk_db: Box<dyn NetworkStorage>
+    request_handler: RequestHandler,
 }
+
+unsafe impl Send for Network {}
+unsafe impl Sync for Network {}
 
 impl Network {
     pub async fn new(
-        swarm: Arc<Mutex<Swarm<DistributedBehaviour>>>,
+        local_peer_id: PeerId,
         keypair: KeyPair,
         chain_context: Arc<tokio::sync::RwLock<ChainContext>>,
         mem_db: Arc<tokio::sync::Mutex<InMemoryDb>>,
         config: ConfigurationExporter,
-        request_handler: RequestHandler<Box<dyn NetworkStorage>>,
-        disk_db: Box<dyn NetworkStorage>
-    ) -> anyhow::Result<(NetworkHandle, mpsc::UnboundedReceiver<NetworkHandleMessage>)> {
-        let (_network_tx, network_rx) = mpsc::unbounded_channel();
-    
+    ) -> anyhow::Result<NetworkHandle> {
+        let (network_tx, mut network_rv) = mpsc::channel(100);
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new()));
+
+        let behaviour = DistributedBehaviour::new(local_peer_id, keypair.keypair().clone().into());
+
+        let swarm = Arc::new(Mutex::new(
+            SwarmBuilder::with_existing_identity(keypair.keypair().clone().into())
+                .with_tokio()
+                .with_tcp(
+                    libp2p::tcp::Config::default(),
+                    libp2p::noise::Config::new,
+                    libp2p::yamux::Config::default,
+                )?
+                .with_behaviour(|_| Ok(behaviour))?
+                .build(),
+        ));
+
+        let request_handler = RequestHandler::new(
+            swarm.clone(),
+            local_peer_id.clone(),
+            mem_db.clone(),
+            RetryConfig::default(),
+        );
+
         let network = Arc::new(Mutex::new(Self {
-            swarm,
-            peer_manager: PeerManager::new(),
+            swarm: swarm.clone(),
+            peer_manager,
             keypair: keypair.clone(),
             chain_context,
             mem_db,
-            outbound_context: HashMap::new(),
-            outbound_proposals: Arc::new(Mutex::new(HashMap::new())),
             config,
-            disk_db,
-            request_handler
+            request_handler,
         }));
 
-        let handle = NetworkHandle::new(network);
-        Ok((handle, network_rx))
+        let swarm_clone = swarm.clone();
+
+        // Swarm a thread to handle swarm events
+        let network_swarm_clone = network.clone();
+        let network_event_clone = network.clone();
+
+        // tokio::spawn(async move {
+        //     while let event = swarm_clone.lock().await.select_next_some().await {
+        //         let mut network_lock = network_swarm_clone.lock().await;
+        //         network_lock.process_swarm_event(event).await;
+        //     }
+        // });
+        
+        // // Second thread (Network events)
+        // tokio::spawn(async move {
+        //     let mut buffer = Vec::with_capacity(50);
+        //     while let event_batch_size = network_rv.recv_many(&mut buffer, 50).await {
+        //         let mut network_lock = network_event_clone.lock().await;
+        //         network_lock.handle_network_events(event_batch_size, &mut buffer).await;
+        //         buffer.clear(); // Clear buffer after processing
+        //     }
+        // });
+       
+
+   
+
+        let handle = NetworkHandle::new(network.clone(), network_tx).await;
+        Ok(handle)
     }
 
-    pub async fn get_next_event(&self) -> SwarmEvent<DistributedBehaviourEvent> {
-        self.swarm.lock().await.select_next_some().await
+    async fn handle_network_events(&mut self, batch_size: usize, events: &mut Vec<NetworkEvent>) {
+        
+            // if events.is_empty() {
+            //     break;
+            // }
+
+            let event = events.pop().unwrap_or(NetworkEvent::Noop);
+            match event {
+                NetworkEvent::Listen(multi_addr) => {
+                    let mut swarm_lock = self.swarm.lock().await;
+                    let _ = swarm_lock.listen_on(multi_addr);
+                }
+                NetworkEvent::SendCompletionConfirmationAck(to, task_id, task_solution) => {
+                    let outbound_req_id = self
+                        .swarm
+                        .lock()
+                        .await
+                        .behaviour_mut()
+                        .conode
+                        .negotiation_protocol
+                        .send_request(
+                            &to,
+                            NegotiationRequest::CompletionAcknowledgement(
+                                to.to_string(),
+                                task_id,
+                                task_solution,
+                            ),
+                        );
+                }
+                NetworkEvent::Join => {
+                    self.join_gossip_protocol().await;
+                }
+                NetworkEvent::Publish(task_broadcast) => {
+                    self.broadcast_work(&task_broadcast).await;
+                }
+                NetworkEvent::InitiateNegotiation(peer_id, task_id, mut negotiation) => {
+                    self.initiate_negotiation(&peer_id, &task_id, &mut negotiation)
+                        .await;
+                }
+                NetworkEvent::RequestCompletionAcknowledgement(peer_id, mut negotiation) => {
+                    self.request_completion_ack(&peer_id, negotiation).await;
+                }
+                NetworkEvent::SendCompletionConfirmationRequest(peer_id, negotiation_id) => {
+                    self.send_completion_confirmation_request(&peer_id, &negotiation_id)
+                        .await;
+                }
+                NetworkEvent::Shutdown => {
+                    self.shutdown().await;
+                }
+                NetworkEvent::AddPeerToKademlia(peer_id, multiaddr) => {
+                    let routing_update = self
+                        .swarm
+                        .lock()
+                        .await
+                        .behaviour_mut()
+                        .conode
+                        .kademlia
+                        .add_address(&peer_id, multiaddr);
+                }
+                NetworkEvent::BootstrapKademlia => {
+                    // We don't handle the routing update here. The network will receive a swarm event
+                    // with the routing update if successful.
+                    let _ = self
+                        .swarm
+                        .lock()
+                        .await
+                        .behaviour_mut()
+                        .conode
+                        .kademlia
+                        .bootstrap();
+                }
+                NetworkEvent::Noop => todo!(),
+            
+        }
     }
 
-    // Handles events emitted from libp2p swarm.
-    pub async fn handle_swarm_event(
-        &mut self,
-        event: SwarmEvent<DistributedBehaviourEvent>,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut swarm = self.swarm.lock().await;
-
+    pub async fn process_swarm_event(&mut self, event: SwarmEvent<DistributedBehaviourEvent>) {
         match event {
             SwarmEvent::Behaviour(behaviour) => match behaviour {
-                DistributedBehaviourEvent::CoNode(conode_event) => {
-                    self.handle_conode_event(conode_event).await?;
-                }
                 DistributedBehaviourEvent::Identify(event) => match event {
                     libp2p::identify::Event::Received {
                         connection_id: _,
                         peer_id,
                         info,
                     } => {
-                        self.peer_manager.add_peer_identity(&peer_id, info).await;
+                        self.peer_manager
+                            .lock()
+                            .await
+                            .add_peer_identity(&peer_id, info)
+                            .await;
                     }
                     libp2p::identify::Event::Sent {
                         connection_id: _,
@@ -182,7 +299,11 @@ impl Network {
                         peer_id,
                         info,
                     } => {
-                        self.peer_manager.new_identification(peer_id, info).await;
+                        self.peer_manager
+                            .lock()
+                            .await
+                            .new_identification(peer_id, info)
+                            .await;
                     }
                     libp2p::identify::Event::Error {
                         connection_id: _,
@@ -194,7 +315,8 @@ impl Network {
                 },
                 DistributedBehaviourEvent::AutoNat(_event) => {
                     info!("[AutoNat::Event]: For future use");
-                } 
+                }
+                _ => {}
             },
             SwarmEvent::ConnectionEstablished {
                 peer_id,
@@ -207,6 +329,8 @@ impl Network {
                 let peer_connection = PeerConnection::new(connection_id, endpoint);
 
                 self.peer_manager
+                    .lock()
+                    .await
                     .new_peer_connection(peer_id, peer_connection)
                     .await;
             }
@@ -218,6 +342,8 @@ impl Network {
                 cause,
             } => {
                 self.peer_manager
+                    .lock()
+                    .await
                     .close_peer_connection(&peer_id, cause)
                     .await;
             }
@@ -226,6 +352,8 @@ impl Network {
                 address,
             } => {
                 self.peer_manager
+                    .lock()
+                    .await
                     .new_listen_addr(listener_id, address)
                     .await;
             }
@@ -234,13 +362,16 @@ impl Network {
                 address,
             } => {
                 // Expire the address
-                // self.peer_manager
+                // self.peer_manager.lock().await
                 //     .expire_address(listener_id, &address)
                 //     .await;
 
                 // Attempt to reconnect
-                if let Ok(listener_id) = swarm.listen_on(address.clone()) {
+
+                if let Ok(listener_id) = self.swarm.lock().await.listen_on(address.clone()) {
                     self.peer_manager
+                        .lock()
+                        .await
                         .new_listen_addr(listener_id, address)
                         .await;
                 }
@@ -252,22 +383,25 @@ impl Network {
             } => {
                 let _ = self
                     .peer_manager
+                    .lock()
+                    .await
                     .close_listener(listener_id, ListenerCloseReason::Done)
                     .await;
             }
             SwarmEvent::ListenerError { listener_id, error } => {
                 let _ = self
                     .peer_manager
+                    .lock()
+                    .await
                     .set_listener_error(listener_id, error)
                     .await;
             }
             _ => {}
         }
-        Ok(())
     }
 
     /// Handles events related to the CoNode protocol including: Gossipsub and RequestResponse.
-    async fn handle_conode_event(&self, event: CoNodeEvent) -> Result<(), Box<dyn Error>> {
+    async fn handle_conode_event(&mut self, event: CoNodeEvent) -> Result<(), Box<dyn Error>> {
         match event {
             CoNodeEvent::NegotiationRequestResponse(event) => match event {
                 RequestResponseEvent::Message { peer, message } => match message {
@@ -286,28 +420,38 @@ impl Network {
                         self.handle_negotiation_response(request_id, response).await;
                     }
                 },
-                RequestResponseEvent::OutboundFailure { peer, request_id, error } => {
-      
-                    
-                }
-                RequestResponseEvent::InboundFailure { peer, request_id, error } => todo!(),
+                RequestResponseEvent::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                } => {}
+                RequestResponseEvent::InboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                } => todo!(),
                 RequestResponseEvent::ResponseSent { peer, request_id } => todo!(),
-                
             },
             CoNodeEvent::Kademlia(event) => {
-                self.peer_manager.handle_kad_event(event).await;
+                self.peer_manager.lock().await.handle_kad_event(event).await;
             }
             CoNodeEvent::Mdns(event) => {
                 let event_clone = event.clone();
 
-                self.peer_manager.handle_mdns_event(event).await;
+                self.peer_manager
+                    .lock()
+                    .await
+                    .handle_mdns_event(event)
+                    .await;
 
                 // Update kademlia if needed
                 match event_clone {
                     libp2p::mdns::Event::Discovered(discovered_nodes) => {
                         for node in discovered_nodes.clone().iter() {
                             self.swarm
-                                .lock().await.behaviour_mut()
+                                .lock()
+                                .await
+                                .behaviour_mut()
                                 .conode
                                 .kademlia
                                 .add_address(&node.0, node.1.clone());
@@ -316,7 +460,9 @@ impl Network {
                     libp2p::mdns::Event::Expired(expired_nodes) => {
                         for node in expired_nodes.iter() {
                             self.swarm
-                                .lock().await.behaviour_mut()
+                                .lock()
+                                .await
+                                .behaviour_mut()
                                 .conode
                                 .kademlia
                                 .remove_address(&node.0, &node.1.clone());
@@ -332,7 +478,7 @@ impl Network {
                 } => {
                     let _ = self.handle_gossipsub_message(message).await;
                 }
-                 _ => {}
+                _ => {}
             },
         }
         Ok(())
@@ -342,7 +488,9 @@ impl Network {
     pub async fn peer_info(&self) -> PeerInfo {
         let connected_addr = Some(
             self.swarm
-                .lock().await.listeners()
+                .lock()
+                .await
+                .listeners()
                 .next()
                 .map(|addr| addr.clone())
                 .unwrap_or(Multiaddr::empty()),
@@ -357,7 +505,7 @@ impl Network {
 
     /// Shutdown the network.
     pub async fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
-        // Close all listeners
+     //   Close all listeners
         // let listener_ids: Vec<_> = self
         //     .peer_manager
         //     .listener_statuses
@@ -368,18 +516,18 @@ impl Network {
         //     .collect();
 
         // for id in listener_ids {
-        //     self.swarm.remove_listener(id);
+        //     self.swarm.lock().await.remove_listener(id);
         // }
 
-        // let peers: Vec<_> = self.swarm.connected_peers().cloned().collect();
+        // let peers: Vec<_> = self.swarm.lock().await.connected_peers().cloned().collect();
 
         // // Disconnect and remove all peers from the KADHT
         // for peer in peers {
-        //     if let Err(e) = self.swarm.disconnect_peer_id(peer) {
+        //     if let Err(e) = self.swarm.lock().await.disconnect_peer_id(peer) {
         //         log::warn!("Failed to disconnect from peer {}: {:?}", peer, e);
         //     }
 
-        //     self.swarm
+        //     self.swarm.lock().await
         //         .behaviour_mut()
         //         .conode
         //         .kademlia
@@ -387,10 +535,10 @@ impl Network {
         // }
 
         // // Clear any pending messages/state
-        // self.peer_manager.clear_state().await;
+        // self.peer_manager.lock().await.clear_state().await;
 
         // log::info!("Network shutdown completed");
-        // Ok(())
+
         Ok(())
     }
 }
@@ -435,7 +583,9 @@ impl Seeker for Network {
         async move {
             let publish_result = self
                 .swarm
-                .lock().await.behaviour_mut()
+                .lock()
+                .await
+                .behaviour_mut()
                 .conode
                 .gossipsub
                 .publish(work_discovery_topic(), bincode::serialize(data).unwrap());
@@ -474,8 +624,6 @@ impl Negotiator for Network {
         _job_id: &String,
         negotiation: &mut Negotiation,
     ) -> Result<(), NetworkError> {
-
-
         // Set the correct negotiation status
         assert!(negotiation.status == None);
         negotiation.status = Some(ProposalStatus::Proposed);
@@ -490,16 +638,18 @@ impl Negotiator for Network {
             .mem_db
             .lock()
             .await
-            .save_or_update_proposal(&negotiation).await;
+            .save_or_update_proposal(&negotiation)
+            .await;
 
-        let outbound_req_id = self.swarm
-            .lock().await.behaviour_mut()
+        let outbound_req_id = self
+            .swarm
+            .lock()
+            .await
+            .behaviour_mut()
             .conode
             .negotiation_protocol
             .send_request(recipient, new_proposal_request);
 
-
-   
         Ok(())
     }
 
@@ -556,7 +706,9 @@ impl Negotiator for Network {
 
         let _outbound_request_id = self
             .swarm
-            .lock().await.behaviour_mut()
+            .lock()
+            .await
+            .behaviour_mut()
             .conode
             .negotiation_protocol
             .send_request(recipient, request_completion_ack_request);
@@ -628,7 +780,9 @@ impl Negotiator for Network {
             // to the chain.
             let _request = self
                 .swarm
-                .lock().await.behaviour_mut()
+                .lock()
+                .await
+                .behaviour_mut()
                 .conode
                 .negotiation_protocol
                 .send_request(
@@ -740,7 +894,9 @@ impl Negotiator for Network {
                     // network request.
                     if let Ok(_) = transaction_result {
                         self.swarm
-                            .lock().await.behaviour_mut()
+                            .lock()
+                            .await
+                            .behaviour_mut()
                             .conode
                             .negotiation_protocol
                             .send_request(
@@ -767,14 +923,12 @@ impl Negotiator for Network {
     /// Request handler for [NegotiationRequest]. See [NegotiationRequest] to learn about
     /// the signifigance of each enum variant.
     async fn handle_negotiation_request(
-        &self,
+        &mut self,
         from: PeerId,
         _request_id: InboundRequestId,
         request: NegotiationRequest,
         channel: ResponseChannel<NegotiationResponse>,
     ) {
-        let mut cs_mutable_swarm = self.swarm.lock().await;
-        let mutable_behaviour = cs_mutable_swarm.behaviour_mut();
         match request {
             NegotiationRequest::NewProposal(_from, mut negotiation) => {
                 negotiation.status = Some(ProposalStatus::Acknowledged);
@@ -790,13 +944,20 @@ impl Negotiator for Network {
 
                         // We don't handle the response result here as we expect an ResponseResponse::InboundError
                         // if this occurs
-                        let _result = mutable_behaviour.conode.negotiation_protocol.send_response(
-                            channel,
-                            NegotiationResponse::ProposalAcknowledgement(
-                                peer_id.to_owned(),
-                                negotiation.id,
-                            ),
-                        );
+                        let _result = self
+                            .swarm
+                            .lock()
+                            .await
+                            .behaviour_mut()
+                            .conode
+                            .negotiation_protocol
+                            .send_response(
+                                channel,
+                                NegotiationResponse::ProposalAcknowledgement(
+                                    peer_id.to_owned(),
+                                    negotiation.id,
+                                ),
+                            );
                     }
                     Err(err) => {
                         log_warning(format!(
@@ -884,7 +1045,9 @@ impl Negotiator for Network {
 
                     let _ = self
                         .swarm
-                        .lock().await.behaviour_mut()
+                        .lock()
+                        .await
+                        .behaviour_mut()
                         .conode
                         .negotiation_protocol
                         .send_response(channel, acknowledgement);
@@ -916,7 +1079,9 @@ impl Negotiator for Network {
 
                 let _ = self
                     .swarm
-                    .lock().await.behaviour_mut()
+                    .lock()
+                    .await
+                    .behaviour_mut()
                     .conode
                     .negotiation_protocol
                     .send_response(
@@ -929,7 +1094,9 @@ impl Negotiator for Network {
                 // and properly updated the work submission as of the latest block.
                 let _ = self
                     .swarm
-                    .lock().await.behaviour_mut()
+                    .lock()
+                    .await
+                    .behaviour_mut()
                     .conode
                     .negotiation_protocol
                     .send_response(channel, NegotiationResponse::SolutionAck);
@@ -1019,11 +1186,17 @@ impl GossipsubNodeProvider for Network {
             // broadcast, i.e. opportunities
             if let Ok(work) = bincode::deserialize::<WorkBroadcast>(&message.data) {
                 log_info(format!(
-                    "Discovered potential work opportunity from peer {}", work.peer_info.peer_id.to_string()))
-                    .await;
-                    let _ = self.handle_potential_work(&work, &message).await;
+                    "Discovered potential work opportunity from peer {}",
+                    work.peer_info.peer_id.to_string()
+                ))
+                .await;
+                let _ = self.handle_potential_work(&work, &message).await;
             } else {
-                    log_info(format!("Received a gossipsub message from {}. Unable to deserialize.", message.source.unwrap_or(PeerId::random()))).await;
+                log_info(format!(
+                    "Received a gossipsub message from {}. Unable to deserialize.",
+                    message.source.unwrap_or(PeerId::random())
+                ))
+                .await;
             }
 
             Ok(())
@@ -1037,7 +1210,9 @@ impl GossipsubNodeProvider for Network {
         async move {
             match self
                 .swarm
-                .lock().await.behaviour_mut()
+                .lock()
+                .await
+                .behaviour_mut()
                 .conode
                 .gossipsub
                 .subscribe(&work_discovery_topic())

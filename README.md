@@ -1,8 +1,8 @@
 # CoNode
 
-CoNode is a library and p2p node designed to be used with libp2p and the Conode protocol that enables peer-to-peer work relationships without intermediaries. It provides a trustless platform where employers can broadcast work opportunities and interact directly with workers through a decentralized network.
+CoNode is a library and p2p node designed to be used with the Conode protocol. It enables peer-to-peer work relationships without intermediaries. It provides a trustless platform where employers can broadcast work opportunities and interact directly with workers through a decentralized network.
 
-Run a node to participate in the network and interact using the iced interface found in crates/conode-cli.
+Run a node to participate in the network and interact using the Iced interface found in crates/conode-cli.
 
 ## Features
 
